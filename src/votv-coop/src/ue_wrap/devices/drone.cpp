@@ -345,7 +345,6 @@ uint8_t ReadFxBits(void* drone) {
     bool leaveAfter5min = false;
     if (ReadLeaveAfter5min(drone, leaveAfter5min) && leaveAfter5min) bits |= kFxLeaveAfter5min;
     if (EnsureGateFieldsResolved()) {
-            bits |= kFxArrived;  // parked/arrived -> the interaction gate
         const auto readBool = [drone](int32_t off) -> bool {
             return off >= 0 && *reinterpret_cast<const bool*>(reinterpret_cast<const char*>(drone) + off);
         };
