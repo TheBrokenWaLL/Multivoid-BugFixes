@@ -345,16 +345,23 @@ uint8_t ReadFxBits(void* drone) {
     bool leaveAfter5min = false;
     if (ReadLeaveAfter5min(drone, leaveAfter5min) && leaveAfter5min) bits |= kFxLeaveAfter5min;
     if (EnsureGateFieldsResolved()) {
-        if (g_canTakeOffOff >= 0 &&
-            *reinterpret_cast<const bool*>(reinterpret_cast<const char*>(drone) + g_canTakeOffOff))
             bits |= kFxArrived;  // parked/arrived -> the interaction gate
+        const auto readBool = [drone](int32_t off) -> bool {
+            return off >= 0 && *reinterpret_cast<const bool*>(reinterpret_cast<const char*>(drone) + off);
+        };
+        if (readBool(g_canTakeOffOff)) bits |= kFxArrived;  // parked/arrived -> the interaction gate
+        // Keep the Blueprint's own hasSack flag as the fallback when its sack actor is not resolvable.
+        // triggerFly/compileOrder may also consult this game-owned flag; an incomplete actor search
+        // must not turn a normal drone operation into a false "no sack" state.
+        if (readBool(g_hasSackOff)) bits |= kFxHasSack;
     }
-    // The Blueprint's hasSack byte can outlive the sack's physical attachment (notably after a
-    // host-authoritative drop). Use the actual shared-container actor and attach parent as the
-    // source of truth, so a bare drone never advertises a sack interaction.
+    // When the actor is positively found detached, its physical state is authoritative for the
+    // interaction gate and can safely clear a stale Blueprint flag. If actor lookup fails, retain
+    // the game-owned hasSack value above instead of mutating the drone into an unusable state.
     if (void* sack = FindSack(drone)) {
         bits |= kFxSackPresent;
         if (IsSackAttached(drone, sack)) bits |= kFxSackAttached | kFxHasSack;
+        else bits &= static_cast<uint8_t>(~kFxHasSack);
         if (E::IsActorRootSimulatingPhysics(sack)) bits |= kFxSackSimulating;
     }
     // FX components are optional; their absence must not hide the interaction-gate state above.
