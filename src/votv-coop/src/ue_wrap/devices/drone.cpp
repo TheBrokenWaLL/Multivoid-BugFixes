@@ -68,23 +68,32 @@ int32_t g_hasSackOff   = -1;   // Adrone_C::hasSack   @0x0501
 int32_t g_containerOff = -1;   // Adrone_C::container @0x04F8 (Aprop_inventoryContainer_drone_C*)
 constexpr int32_t kHasSackFallback   = 0x0501;
 constexpr int32_t kContainerFallback = 0x04F8;
+bool g_gateFieldsResolved = false;
+
+bool EnsureGateFieldsResolved() {
+    if (g_gateFieldsResolved) return true;
+    if (!EnsureResolved() || !g_cls) return false;
+    g_canTakeOffOff = R::FindPropertyOffset(g_cls, L"canTakeOff");
+    if (g_canTakeOffOff < 0) g_canTakeOffOff = kCanTakeOffFallback;
+    g_hasSackOff = R::FindPropertyOffset(g_cls, L"hasSack");
+    if (g_hasSackOff < 0) g_hasSackOff = kHasSackFallback;
+    g_containerOff = R::FindPropertyOffset(g_cls, L"container");
+    if (g_containerOff < 0) g_containerOff = kContainerFallback;
+    g_gateFieldsResolved = true;
+    return true;
+}
 
 bool EnsureFxResolved() {
     if (g_fxResolved) return true;
     if (g_fxTried || !EnsureResolved() || !g_cls) return false;
     g_fxTried = true;
-    g_canTakeOffOff = R::FindPropertyOffset(g_cls, L"canTakeOff");
-    if (g_canTakeOffOff < 0) g_canTakeOffOff = kCanTakeOffFallback;
+    if (!EnsureGateFieldsResolved()) return false;
     g_dustOff = R::FindPropertyOffset(g_cls, L"eff_droneDust");
     if (g_dustOff < 0) g_dustOff = kDustFallback;
     g_audioAlarmOff = R::FindPropertyOffset(g_cls, L"audio_alarm");
     if (g_audioAlarmOff < 0) g_audioAlarmOff = kAudioAlarmFallback;
     g_lightAlarmOff = R::FindPropertyOffset(g_cls, L"light_alarm");
     if (g_lightAlarmOff < 0) g_lightAlarmOff = kLightAlarmFallback;
-    g_hasSackOff = R::FindPropertyOffset(g_cls, L"hasSack");
-    if (g_hasSackOff < 0) g_hasSackOff = kHasSackFallback;
-    g_containerOff = R::FindPropertyOffset(g_cls, L"container");
-    if (g_containerOff < 0) g_containerOff = kContainerFallback;
     // SetActive/Activate and bIsActive are declared on UActorComponent (the components' base); resolve
     // them there and dispatch on the concrete component instance (ProcessEvent resolves the impl).
     if (void* acCls = R::FindClass(L"ActorComponent")) {
@@ -224,14 +233,17 @@ uint8_t ReadFxBits(void* drone) {
     uint8_t bits = 0;
     bool leaveAfter5min = false;
     if (ReadLeaveAfter5min(drone, leaveAfter5min) && leaveAfter5min) bits |= kFxLeaveAfter5min;
+    if (EnsureGateFieldsResolved()) {
+        const auto rb = [drone](int32_t off) -> bool {
+            return off >= 0 && *reinterpret_cast<const bool*>(reinterpret_cast<const char*>(drone) + off);
+        };
+        if (rb(g_canTakeOffOff)) bits |= kFxArrived;  // parked/arrived -> the interaction gate
+        if (rb(g_hasSackOff))    bits |= kFxHasSack;  // cargo aboard -> the action-option prerequisite
+    }
+    // FX components are optional; their absence must not hide the interaction-gate state above.
     if (!EnsureFxResolved()) return bits;
     if (void* dust = ReadComp(drone, g_dustOff))
         if (ComponentIsActive(dust)) bits |= kFxDust;
-    auto rb = [drone](int32_t off) -> bool {
-        return off >= 0 && *reinterpret_cast<const bool*>(reinterpret_cast<const char*>(drone) + off);
-    };
-    if (rb(g_canTakeOffOff)) bits |= kFxArrived;   // parked/arrived -> the interaction gate
-    if (rb(g_hasSackOff))    bits |= kFxHasSack;   // cargo aboard -> the action-option prerequisite
     return bits;
 }
 
@@ -309,37 +321,46 @@ void SetSignalLight(void* drone, bool on) {
     }
 }
 
-void WriteGateFields(void* drone, bool canTakeOff, bool hasSack) {
-    if (!drone || !EnsureFxResolved()) return;
-    // The client's suppressed tick never sets these, so a parked mirror drone reads "in motion" +
-    // shows no action options. Mirror the host's values so a parked drone is interactable (RE: the
-    // actionOptionIndex gate is `IFNOT(canTakeOff) -> "drone is in motion"`; getActionOptions needs
-    // hasSack for the open-inv/drop options to appear).
-    if (g_canTakeOffOff >= 0)
-        *reinterpret_cast<bool*>(reinterpret_cast<char*>(drone) + g_canTakeOffOff) = canTakeOff;
-    if (g_hasSackOff >= 0)
-        *reinterpret_cast<bool*>(reinterpret_cast<char*>(drone) + g_hasSackOff) = hasSack;
+bool CanDropSack(void* drone) {
+    if (!drone || !EnsureGateFieldsResolved()) return false;
+    const char* const bytes = reinterpret_cast<const char*>(drone);
+    return *reinterpret_cast<const bool*>(bytes + g_canTakeOffOff) &&
+           *reinterpret_cast<const bool*>(bytes + g_hasSackOff);
 }
 
-void RepointContainer(void* drone) {
-    if (!drone || !EnsureFxResolved() || g_containerOff < 0) return;
-    // openPropInv(container) reads the mirror drone's OWN container@0x04F8, which the suppressed tick
-    // never populates. The container actor itself (Aprop_inventoryContainer_drone_C, keyed
-    // 'droneContainer') is already mirrored by the prop pipeline -- find it + point the field at it so
-    // the inventory opens. Idempotent: only writes when the field is null + the actor exists.
-    void** slot = reinterpret_cast<void**>(reinterpret_cast<char*>(drone) + g_containerOff);
-    if (*slot && R::IsLive(*slot)) return;  // already pointed at a live container
-    if (void* c = R::FindObjectByClass(L"prop_inventoryContainer_drone_C")) {
-        *slot = c;
-        UE_LOGI("drone: repointed mirror container @0x%04X -> %p (prop-mirrored 'droneContainer')",
-                g_containerOff, c);
-    }
+bool DropSack(void* drone) {
+    if (!drone || !R::IsLive(drone)) return false;
+    void* const fn = R::FindDispatchFunctionCached(R::ClassOf(drone), L"dropSack");
+    if (!fn) return false;
+    ParamFrame frame(fn);
+    return frame.valid() && Call(drone, frame);
+}
+
+void WriteGateFields(void* drone, bool canTakeOff, bool hasSack) {
+    if (!drone || !EnsureGateFieldsResolved()) return;
+    // The client's suppressed tick never sets these, so a parked mirror drone reads "in motion" +
+    // shows no action options. Mirror the host's values so the same interaction options are exposed.
+    *reinterpret_cast<bool*>(reinterpret_cast<char*>(drone) + g_canTakeOffOff) = canTakeOff;
+    *reinterpret_cast<bool*>(reinterpret_cast<char*>(drone) + g_hasSackOff) = hasSack;
+}
+
+bool SetContainer(void* drone, void* container) {
+    if (!drone || !container || !R::IsLive(drone) || !R::IsLive(container) ||
+        !EnsureGateFieldsResolved()) return false;
+    void* const containerClass = R::FindClass(L"prop_inventoryContainer_drone_C");
+    void* const actualClass = R::ClassOf(container);
+    if (!containerClass || !actualClass || !R::IsDescendantOfAny(actualClass, &containerClass, 1)) return false;
+
+    void** const slot = reinterpret_cast<void**>(reinterpret_cast<char*>(drone) + g_containerOff);
+    if (*slot == container) return true;
+    void* const previous = *slot;
+    *slot = container;
+    UE_LOGI("drone: bound shared sack container @0x%04X %p -> %p", g_containerOff, previous, container);
+    return true;
 }
 
 void* ContainerOf(void* drone) {
-    if (!drone) return nullptr;
-    EnsureFxResolved();   // sets the offset (its FX members are not needed here)
-    if (g_containerOff < 0) return nullptr;
+    if (!drone || !EnsureGateFieldsResolved()) return nullptr;
     void* const c = *reinterpret_cast<void* const*>(reinterpret_cast<const char*>(drone) + g_containerOff);
     return c && R::IsLive(c) ? c : nullptr;
 }

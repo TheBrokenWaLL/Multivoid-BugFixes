@@ -13,6 +13,7 @@
 #include "coop/element/lerp_window.h"
 #include "coop/net/protocol.h"
 #include "coop/net/session.h"
+#include "coop/props/prop_key_index.h"
 
 #include "ue_wrap/devices/drone.h"
 #include "ue_wrap/core/log.h"
@@ -32,6 +33,7 @@ using ue_wrap::FVector;
 using ue_wrap::FRotator;
 
 constexpr uint64_t kSendIntervalMs = 50;   // ~20 Hz at most, while the drone moves or its state changes
+constexpr uint64_t kContainerBindRetryMs = 1000; // retry after the world/key index loads or the actor respawns
 // Past its flight and its dust, how far the drone must be from the pose last sent for a new one to
 // go: a glide streams until it is this close to where it rests, and a parked drone sends nothing.
 constexpr float    kMoveEpsCm  = 1.0f;
@@ -65,6 +67,8 @@ DroneMirror g_m;
 // state when Active or the FX / gate bits differ from it. The check itself runs at the send cadence,
 // so a parked drone costs a few memory reads twenty times a second.
 uint64_t g_nextCheckMs = 0;
+uint64_t g_nextContainerBindMs = 0;
+bool g_containerBindWarned = false;
 bool     g_haveSent   = false;
 FVector  g_sentLoc{};
 FRotator g_sentRot{};
@@ -75,6 +79,24 @@ bool     g_installLogged  = false;  // latch the install log (Install is the per
 uint64_t NowMs() {
     return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::steady_clock::now().time_since_epoch()).count());
+}
+
+// Both drone_C::compileOrder and prop_dronesack_C::openPropInv must see the same GObjStack slot.
+// The drone's cooked BeginPlay lookup uses the unrelated key "droneContainer" and can leave its
+// container field pointing at a private, live-but-wrong inventory. Resolve the sack's world actor
+// by its exact key and bind the drone to it on both peers. Retry slowly: the key index may still be
+// seeding when the session starts, and the keyed actor can be recreated with a new address.
+void BindSharedSackContainer(void* drone) {
+    const uint64_t nowMs = NowMs();
+    if (nowMs < g_nextContainerBindMs) return;
+    g_nextContainerBindMs = nowMs + kContainerBindRetryMs;
+
+    void* const container = coop::prop_key_index::Find(L"drone_InventoryContainer");
+    if (!container) return; // world not indexed yet; retry on the next interval
+    if (!D::SetContainer(drone, container) && !g_containerBindWarned) {
+        g_containerBindWarned = true;
+        UE_LOGW("drone_sync: key 'drone_InventoryContainer' resolved, but it is not a live drone inventory container");
+    }
 }
 
 // The host's drone as one check reads it, from memory.
@@ -190,13 +212,6 @@ void ApplyState(void* drone, const coop::net::DroneStatePayload& payload) {
         g_m.leaveWriteWarned = true;
         UE_LOGW("drone_sync: the host's leave timer could not be written onto this copy's drone");
     }
-    if (hasSack)
-        D::RepointContainer(drone);  // cargo aboard -> point the mirror at the prop-mirrored container.
-                                     // EVERY hasSack packet (not just the rising edge): the container
-                                     // may stream in AFTER the edge, or be destroyed+respawned (new
-                                     // address) -- RepointContainer short-circuits when the field is
-                                     // already a live container, so steady-state cost is ~one deref.
-
     // Dust: replay the blueprint's per-tick dust update on EVERY packet rather than on bit edges.
     // The anchor moves with the drone, the intensity tracks ground distance, and the
     // EmitterLoops=1/20s system self-completes and needs the IsActive != want re-arm -- all of it
@@ -271,6 +286,10 @@ void Tick() {
     void* drone = D::Find();
     if (!drone) return;
 
+    // The drone and the sack open the same delivery inventory. Keep the drone's field bound to the
+    // exact keyed actor on host and client, even when no sack is currently attached.
+    BindSharedSackContainer(drone);
+
     if (s->role() == coop::net::Role::Host) {
         // HOST authority. While the drone is Active or its dust is on, the stream runs as it always did:
         // the client replays the dust once per packet, and the effect ends itself unless re-armed. Past
@@ -320,6 +339,8 @@ void OnDisconnect() {
     }
     g_m = DroneMirror{};
     g_nextCheckMs = 0;
+    g_nextContainerBindMs = 0;
+    g_containerBindWarned = false;
     g_haveSent = false;
     g_sentLoc = FVector{};
     g_sentRot = FRotator{};

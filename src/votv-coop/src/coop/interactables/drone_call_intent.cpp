@@ -36,7 +36,9 @@ namespace sg = ue_wrap::script_gate;
 // matches whichever class the running world loads under that name: a level class is never kept by
 // pointer across worlds.
 UE_FACT_FN(kRowActionOptionIndex, "drone_call_intent", L"droneConsole_C", L"actionOptionIndex", Declared);
+UE_FACT_FN(kRowDropSack, "drone_call_intent", L"drone_C", L"dropSack", Dispatch);
 constexpr int kTagDroneCall = 0x44524f4e;  // 'DRON'
+constexpr int kTagDropSack = 0x4452534B;  // 'DRSK'
 
 // The action the console's own switch routes to its faces. Its other cases, 10 and 11, are the
 // lid, which is already a synced door and must keep running locally.
@@ -45,6 +47,7 @@ constexpr uint8_t kActionUse = 4;
 // A console press is an arm's-length interaction, so the sender's reach is the desk's rather than
 // the pile grab's: the console is a small box a player stands at.
 constexpr float kConsoleReachUU = 400.0f;
+constexpr float kDroneReachUU = 400.0f;
 
 // One press is one call. The drone's own body ignores a press it cannot honour, so a burst costs
 // nothing but the dispatch; the bound is here so a stalled client's backlog neither stalls a frame
@@ -56,8 +59,9 @@ constexpr uint64_t kRefusalSayMs   = 10000;
 std::atomic<coop::net::Session*> g_session{nullptr};
 bool g_watchInstalled = false;
 bool g_watchLive = false;
+bool g_dropSackWatchInstalled = false;
 
-uint64_t g_sent = 0, g_flown = 0, g_denied = 0;
+uint64_t g_sent = 0, g_flown = 0, g_dropSacksSent = 0, g_dropSacks = 0, g_denied = 0;
 
 // One sender: its queued presses with their bucket, and the latches that clear with its occupant.
 struct Slot {
@@ -65,14 +69,73 @@ struct Slot {
     uint64_t nextSayMs = 0;      // the full queue's refusal, said once in kRefusalSayMs
     bool     waitSaid  = false;  // a wait for the body, said once a streak
 };
+sg::Verdict OnDropSackPre(const sg::Call& call);
+
 coop::roster_ledger::PerSlotState<Slot> g_slots;
+
+bool EnsureDropSackWatch() {
+    if (g_dropSackWatchInstalled) return true;
+    void* const droneClass = R::FindClass(L"drone_C");
+    if (!droneClass) return false;
+    const auto fn = ue_wrap::facts::ResolveOn(kRowDropSack, droneClass);
+    if (!fn) return false;
+    g_dropSackWatchInstalled = sg::Watch(fn, kTagDropSack, &OnDropSackPre, nullptr);
+    if (g_dropSackWatchInstalled)
+        UE_LOGI("[DRONE-CALL] the drone sack-drop gate is live");
+    return g_dropSackWatchInstalled;
+}
 
 // ---- host side -------------------------------------------------------------------------------
 // One press, run or refused and then consumed, or left at the head of its queue: false while the host
 // has no body for the sender, the seconds between a joiner's curtain and its first pose. That is a
 // mid-join window rather than a verdict, which the door-verb, keypad and container lanes wait out the
 // same way (principle 8): a press made in it is not lost.
+bool ExecuteDropSack(coop::net::Session& s, uint8_t slot) {
+    const auto token = coop::element::IntentTarget::ForClientIntent(s, slot, kDroneReachUU);
+    if (!token.HasBody()) {
+        if (!g_slots[slot].waitSaid) {
+            g_slots[slot].waitSaid = true;
+            UE_LOGI("[DRONE-CALL] slot %u's sack-drop request waits: the host has no body for it yet",
+                    static_cast<unsigned>(slot));
+        }
+        return false;
+    }
+
+    void* const drone = ue_wrap::drone::Find();
+    if (!drone) {
+        ++g_denied;
+        UE_LOGW("[DRONE-CALL] DENY sack-drop slot=%u -- no delivery drone is present on the host",
+                static_cast<unsigned>(slot));
+        return true;
+    }
+    const auto subject = token.Authorize(drone);
+    if (!subject) {
+        ++g_denied;
+        UE_LOGI("[DRONE-CALL] DENY sack-drop slot=%u -- %s (distance %.0f uu)",
+                static_cast<unsigned>(slot), coop::element::OutcomeName(subject.outcome), subject.distUU);
+        return true;
+    }
+    if (!ue_wrap::drone::CanDropSack(drone)) {
+        ++g_denied;
+        UE_LOGI("[DRONE-CALL] DENY sack-drop slot=%u -- the host drone is not parked with a sack",
+                static_cast<unsigned>(slot));
+        return true;
+    }
+    if (!ue_wrap::drone::DropSack(drone)) {
+        ++g_denied;
+        UE_LOGW("[DRONE-CALL] DENY sack-drop slot=%u -- drone_C::dropSack did not dispatch",
+                static_cast<unsigned>(slot));
+        return true;
+    }
+    ++g_dropSacks;
+    UE_LOGI("[DRONE-CALL] DROP-SACK slot=%u (#%llu) -- host executed drone_C::dropSack",
+            static_cast<unsigned>(slot), static_cast<unsigned long long>(g_dropSacks));
+    return true;
+}
+
 bool Execute(coop::net::Session& s, const coop::net::DroneFlyIntentPayload& p, uint8_t slot) {
+    if (p.verb == coop::net::drone_verb::kDropSack) return ExecuteDropSack(s, slot);
+
     // The console carries no identity to name, so the sender's reach IS the resolve: of this
     // world's consoles, the one the sender is standing at. Any of them calls the same drone, so
     // the first within reach is the press.
@@ -185,20 +248,42 @@ sg::Verdict OnActionPre(const sg::Call& call) {
     return sg::Verdict::Cancel;
 }
 
+// A client drone is a mirror: only the host may execute the sack's world-spawn operation. The
+// AnyClass watch is narrowed to this world's singleton in the callback, so unrelated dropSack
+// functions keep their native bodies.
+sg::Verdict OnDropSackPre(const sg::Call& call) {
+    auto* s = g_session.load(std::memory_order_acquire);
+    if (!s || !s->connected() || s->role() != coop::net::Role::Client || !call.object)
+        return sg::Verdict::Run;
+    if (call.object != ue_wrap::drone::Find()) return sg::Verdict::Run;
+
+    coop::net::DroneFlyIntentPayload p{};
+    p.verb = coop::net::drone_verb::kDropSack;
+    if (!s->SendReliable(coop::net::ReliableKind::DroneFlyIntent, &p, sizeof(p))) {
+        UE_LOGW("[DRONE-CALL] sack-drop request was not sent; local dropSack cancelled to avoid a second bag");
+        return sg::Verdict::Cancel;
+    }
+    ++g_dropSacksSent;
+    if (g_dropSacksSent <= 3 || g_dropSacksSent % 20 == 0)
+        UE_LOGI("[DRONE-CALL] CLIENT SENT sack-drop request (#%llu)",
+                static_cast<unsigned long long>(g_dropSacksSent));
+    return sg::Verdict::Cancel;
+}
+
 }  // namespace
 
 void Install(coop::net::Session* session) {
     g_session.store(session, std::memory_order_release);
     if (!g_watchInstalled)
         g_watchInstalled = sg::WatchName(kRowActionOptionIndex, kTagDroneCall, &OnActionPre, nullptr);
+    EnsureDropSackWatch();
 }
 
 void Tick(coop::net::Session& session) {
     sg::ResolvePendingNames();
-    if (!g_watchInstalled) {
+    if (!g_watchInstalled)
         g_watchInstalled = sg::WatchName(kRowActionOptionIndex, kTagDroneCall, &OnActionPre, nullptr);
-        return;
-    }
+    EnsureDropSackWatch();
     if (!g_watchLive && sg::NameWatchLive(kRowActionOptionIndex, kTagDroneCall)) {
         g_watchLive = true;
         UE_LOGI("[DRONE-CALL] the console action gate is live");
@@ -236,11 +321,12 @@ void OnDroneFlyIntent(coop::net::Session& session, const coop::net::DroneFlyInte
 uint64_t SentCount() { return g_sent; }
 
 void OnDisconnect() {
-    if (g_sent || g_flown || g_denied)
-        UE_LOGI("[DRONE-CALL] session end -- sent=%llu pressed=%llu denied=%llu",
+    if (g_sent || g_flown || g_dropSacksSent || g_dropSacks || g_denied)
+        UE_LOGI("[DRONE-CALL] session end -- console-sent=%llu console-run=%llu sack-sent=%llu sack-run=%llu denied=%llu",
                 static_cast<unsigned long long>(g_sent), static_cast<unsigned long long>(g_flown),
+                static_cast<unsigned long long>(g_dropSacksSent), static_cast<unsigned long long>(g_dropSacks),
                 static_cast<unsigned long long>(g_denied));
-    g_sent = g_flown = g_denied = 0;
+    g_sent = g_flown = g_dropSacksSent = g_dropSacks = g_denied = 0;
 }
 
 }  // namespace coop::drone_call_intent

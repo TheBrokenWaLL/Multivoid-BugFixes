@@ -30,7 +30,7 @@ inline constexpr uint32_t kMagic = 0x564D5450u;
 // This file is past the 1500-line hard cap and stays there: it is the single-feature exception the
 // rule names. One wire format, whose enum, payload structs and static_asserts are read together;
 // splitting it would put a kind's number in one file and its bytes in another.
-inline constexpr uint16_t kProtocolVersion = 264;
+inline constexpr uint16_t kProtocolVersion = 265;
 
 // Default LAN port (overridable via multivoid.ini "net.port=").
 inline constexpr uint16_t kDefaultPort = 47621;
@@ -3512,14 +3512,15 @@ struct GrabRefusedPayload {
 };
 static_assert(sizeof(GrabRefusedPayload) == 8, "GrabRefusedPayload must be 8 bytes");
 
-// A drone-call intent (DroneFlyIntent): the press itself, with which of the console's two faces it
-// was. Which face is the sender's reading of its own cursor, the only machine that has one, and the
-// console carries no identity to name (see the kind's comment), so the host resolves the console
-// the sender stands at and re-tests the lid there.
+// A drone intent (DroneFlyIntent): either a console-face press or a request to take the sack off
+// the parked drone. The console face is the sender's reading of its own cursor; the host resolves
+// the console the sender stands at. A sack-drop request instead resolves the singleton drone and
+// checks the sender's reach to it.
 namespace drone_verb {
 constexpr uint8_t kCall = 0;        // the keyboard's call/send
 constexpr uint8_t kLeaveTimer = 1;  // the leave timer face, a toggle on the host
-constexpr uint8_t kMax = kLeaveTimer;
+constexpr uint8_t kDropSack = 2;    // take the parked drone's sack off; executed only by the host
+constexpr uint8_t kMax = kDropSack;
 }  // namespace drone_verb
 struct DroneFlyIntentPayload {
     uint8_t verb;        // 1 -- drone_verb::k*

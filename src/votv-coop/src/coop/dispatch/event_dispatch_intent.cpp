@@ -588,11 +588,9 @@ bool HandleIntentEvent(net::Session& session,
         break;
     }
     case net::ReliableKind::DroneFlyIntent: {
-        // CLIENT->HOST drone request: a client pressed the keyboard or leave-timer face. The
-        // console is not named -- it is baked into the level and no lane keys it -- so the host
-        // resolves the one the sender stands at from its own world and re-tests the lid there,
-        // then runs the button's own verb. That resolve, the lid and the rate live in the module;
-        // the format lives here.
+        // CLIENT->HOST drone request: a console-face press or a request to remove the parked
+        // drone's sack. The module resolves the relevant world actor, checks the sender's reach,
+        // and executes the host-owned Blueprint verb; the wire format lives here.
         // coop::drone_call_intent::OnDroneFlyIntent.
         if (session.role() != net::Role::Host) {
             UE_LOGW("event_feed: DroneFlyIntent received on a client -- dropping");

@@ -99,9 +99,17 @@ void SetSignalLight(void* drone, bool on);
 // no options -- the suppressed tick never sets them). Game thread.
 void WriteGateFields(void* drone, bool canTakeOff, bool hasSack);
 
-// CLIENT mirror: point the mirror drone's container field at the already-prop-mirrored cargo
-// container (Aprop_inventoryContainer_drone_C) so openPropInv opens it. Idempotent. Game thread.
-void RepointContainer(void* drone);
+// Whether the drone is parked with a sack aboard, using the game's interaction-gate fields.
+// Does not depend on the optional FX components. Game thread.
+bool CanDropSack(void* drone);
+
+// Run the drone's own dropSack Blueprint verb. The multiplayer intent lane calls this on the host
+// after checking the sender's reach and the drone's state. Game thread.
+bool DropSack(void* drone);
+
+// Point the drone at the exact container also opened by its sack. False until the keyed actor is
+// available or when it is not a drone inventory container. Game thread.
+bool SetContainer(void* drone, void* container);
 
 // The container (Aprop_inventoryContainer_drone_C) the drone's `container` field names, or null when the field
 // is null or dead. Game thread.

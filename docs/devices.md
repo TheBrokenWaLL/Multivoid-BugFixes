@@ -361,7 +361,16 @@ machine that owns it and arrives on the stream that already carries it
 body, from a joiner who presses at once, waits for the body rather than being refused, as the
 door-verb, keypad and container lanes wait. The leave-timer face rides the same lane: the host flips
 its own drone's setting, which every peer's copy takes from the drone's state stream, and the console's
-click plays on the presser's machine and on the host.
+click plays on the presser's machine and on the host. Removing the parked drone's sack uses the same
+intent lane: the client cancels its local `drone_C::dropSack`, and the host resolves its own drone,
+checks the sender's reach plus `canTakeOff`/`hasSack`, then runs the Blueprint verb once. The resulting
+sack actor is mirrored by the ordinary prop lanes rather than being created independently on each peer.
+The drone and the sack must also name the same inventory actor. The drone's cooked `BeginPlay`
+looks up `droneContainer`, which misses the world container keyed `drone_InventoryContainer` and
+can leave `drone.container` pointing at a private inventory; `compileOrder` writes through that
+field, while the sack opens the keyed world container. `drone_sync` now resolves the exact keyed
+actor and binds the drone's field to it on both host and client, retrying after world load or actor
+respawn. This keeps item additions, daily-task delivery and sale on the same `GObjStack` slot.
 
 ### The computer and the economy
 
