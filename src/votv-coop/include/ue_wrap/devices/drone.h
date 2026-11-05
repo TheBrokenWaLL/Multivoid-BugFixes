@@ -62,20 +62,40 @@ void RestoreTick(void* drone);
 // alarm cue fires on the canTakeOff false->true edge (drone within 25cm of its drop).
 
 // stateBits packing (DroneStatePayload.stateBits): bit0 = dust active, bit1 = canTakeOff (arrived /
-// the interaction gate), bit2 = hasSack (cargo aboard / the action-option prerequisite), bit3 =
-// leaveAfter5min (the delivery drone's five-minute departure setting).
+// the interaction gate), bit2 = hasSack (a physically attached sack), bit3 = leaveAfter5min,
+// bit4 = sack actor present, bit5 = sack physically attached, bit6 = sack world pose valid,
+// bit7 = sack root simulates physics.
 inline constexpr uint8_t kFxDust     = 0x01;
 inline constexpr uint8_t kFxArrived  = 0x02;
 inline constexpr uint8_t kFxHasSack  = 0x04;
 inline constexpr uint8_t kFxLeaveAfter5min = 0x08;
+inline constexpr uint8_t kFxSackPresent = 0x10;  // the prop_dronesack_C actor exists on this peer
+inline constexpr uint8_t kFxSackAttached = 0x20; // the sack actor is physically attached to the drone
+inline constexpr uint8_t kFxSackPose = 0x40;     // the sack's world transform is valid in the packet
+inline constexpr uint8_t kFxSackSimulating = 0x80; // host sack root currently simulates physics
 
 // Drone's leave mode: true means leave after five minutes, false means wait indefinitely.
 bool ReadLeaveAfter5min(void* drone, bool& out);
 bool WriteLeaveAfter5min(void* drone, bool value);
 
+// Find the drone's sack actor by the shared drone_InventoryContainer pointer. Returns null until
+// the container and prop_dronesack_C actor are available. Game thread.
+void* FindSack(void* drone);
+
+// Read the sack's attachment state. The actor's takenByDrone flag is cross-checked against its
+// actual attach parent when that query is available, so a stale flag cannot leave a phantom drone
+// interaction enabled. Game thread.
+bool IsSackAttached(void* drone, void* sack);
+
+// CLIENT mirror: converge the local sack actor to the host's world pose, then attach/detach it
+// from the drone and toggle root physics. Returns false when a present sack has not spawned yet;
+// the caller should retry on a later tick. Game thread.
+bool ApplySackMirror(void* drone, bool present, bool attached, bool simulatePhysics, bool poseValid,
+                     const FVector& loc, const FRotator& rot);
+
 // HOST: read the synced drone state into the packed stateBits byte:
-// eff_droneDust's bIsActive bit (what its IsActive returns), canTakeOff, hasSack and leaveAfter5min,
-// all from memory with no engine call. Game thread.
+// FX, arrival gate, leaveAfter5min and sack actor state. A sack that exists but is not physically
+// attached does not satisfy the interaction gate. Game thread.
 uint8_t ReadFxBits(void* drone);
 
 // HOST: read eff_droneDust's world location (the BP pins it to its ground-trace hit per tick) for
@@ -99,8 +119,8 @@ void SetSignalLight(void* drone, bool on);
 // no options -- the suppressed tick never sets them). Game thread.
 void WriteGateFields(void* drone, bool canTakeOff, bool hasSack);
 
-// Whether the drone is parked with a sack aboard, using the game's interaction-gate fields.
-// Does not depend on the optional FX components. Game thread.
+// Whether the drone is parked with its sack physically attached. Does not trust a stale hasSack
+// Blueprint byte and does not depend on the optional FX components. Game thread.
 bool CanDropSack(void* drone);
 
 // Run the drone's own dropSack Blueprint verb. The multiplayer intent lane calls this on the host

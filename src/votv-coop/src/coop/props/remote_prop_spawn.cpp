@@ -47,6 +47,7 @@
 #include "ue_wrap/core/hot_path_guard.h"  // UE_ASSERT_GAME_THREAD -- the no-mutex contract tripwire
 #include "ue_wrap/core/log.h"
 #include "ue_wrap/actors/prop.h"
+#include "ue_wrap/devices/drone.h"  // adopt the existing drone-mounted sack instead of spawning a second copy
 #include "ue_wrap/core/reflection.h"
 #include "ue_wrap/core/sdk_profile.h"
 #include "ue_wrap/core/types.h"
@@ -356,6 +357,31 @@ void OnSpawn(const coop::net::PropSpawnPayload& payload, int senderSlot,
     } else {
         existing = coop::prop_key_index::Find(keyW);
     }
+
+    // The sack that starts mounted on the delivery drone can have a different local Key from the
+    // actor the host creates when dropping it. A key-only miss would then spawn a second sack on the
+    // client and leave the old one attached and non-interactive. Reuse the already-loaded mounted
+    // actor for this exact class, then run the normal position-adoption path (including wire rekey).
+    if (!existing && senderSlot == 0 && !fromConvert && !eidOnly && classW == L"prop_dronesack_C") {
+        if (void* drone = ue_wrap::drone::Find()) {
+            if (void* sackContainer = coop::prop_key_index::Find(L"drone_InventoryContainer"))
+                ue_wrap::drone::SetContainer(drone, sackContainer);
+            if (void* mountedSack = ue_wrap::drone::FindSack(drone)) {
+                if (ue_wrap::drone::IsSackAttached(drone, mountedSack)) {
+                    UE_LOGI("remote_prop::OnSpawn: adopting the pre-existing drone-mounted sack %p for host spawn (wire key '%ls')",
+                            mountedSack, keyW.c_str());
+                    // Detach the old mounted copy before convergence; AdoptByPosition supplies the
+                    // host's exact world pose, rekeys the actor and binds it to the incoming eid.
+                    ue_wrap::drone::ApplySackMirror(drone, true, false, false, false,
+                                                   ue_wrap::FVector{}, ue_wrap::FRotator{});
+                    AdoptByPosition(payload, senderSlot, mountedSack, localPlayer);
+                    if (outSpawned) *outSpawned = mountedSack;
+                    return;
+                }
+            }
+        }
+    }
+
     if (existing) {
         // Host authority first, before the claim, the physics branches, the converge and the bind.
         if (HostAuthorityHandback_(existing, keyW, classW, senderSlot, "exact-key")) return;

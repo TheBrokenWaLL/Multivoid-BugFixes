@@ -160,6 +160,64 @@ void ActivateComponent(void* comp) {
     Call(comp, f);
 }
 
+void* g_sackClass = nullptr;
+int32_t g_sackContainerOff = -1;
+int32_t g_sackTakenOff = -1;
+
+bool EnsureSackFieldsResolved() {
+    if (!g_sackClass) g_sackClass = object_index::ClassByName(L"prop_dronesack_C");
+    if (!g_sackClass) return false;
+    if (g_sackContainerOff < 0)
+        g_sackContainerOff = R::FindPropertyOffset(g_sackClass, L"container");
+    if (g_sackTakenOff < 0)
+        g_sackTakenOff = R::FindPropertyOffset(g_sackClass, L"takenByDrone");
+    return g_sackContainerOff >= 0 && g_sackTakenOff >= 0;
+}
+
+struct SackSearch {
+    void* drone = nullptr;
+    void* container = nullptr;
+    void* best = nullptr;
+    bool bestAttached = false;
+    float bestDistanceSq = 1.0e30f;
+};
+
+void FindSackCandidate(void* raw, void* sack, int32_t) {
+    auto& search = *static_cast<SackSearch*>(raw);
+    if (!sack || !R::IsLive(sack)) return;
+    const auto* bytes = reinterpret_cast<const uint8_t*>(sack);
+    void* const container = *reinterpret_cast<void* const*>(bytes + g_sackContainerOff);
+    if (container != search.container) return;
+
+    const bool taken = *reinterpret_cast<const bool*>(bytes + g_sackTakenOff);
+    void* parent = nullptr;
+    const bool parentRead = E::GetAttachParentActor(sack, parent);
+    const bool physicallyAttached = parentRead && parent == search.drone;
+    const bool attached = physicallyAttached || (taken && !parentRead);
+
+    FVector loc{};
+    float distanceSq = 0.f;
+    if (E::TryGetActorLocation(sack, loc)) {
+        FVector droneLoc{};
+        if (E::TryGetActorLocation(search.drone, droneLoc)) {
+            const float dx = loc.X - droneLoc.X, dy = loc.Y - droneLoc.Y, dz = loc.Z - droneLoc.Z;
+            distanceSq = dx * dx + dy * dy + dz * dz;
+        }
+    }
+    if (!search.best || (attached && !search.bestAttached) ||
+        (attached == search.bestAttached && distanceSq < search.bestDistanceSq)) {
+        search.best = sack;
+        search.bestAttached = attached;
+        search.bestDistanceSq = distanceSq;
+    }
+}
+
+bool WriteSackTaken(void* sack, bool taken) {
+    if (!sack || !R::IsLive(sack) || !EnsureSackFieldsResolved()) return false;
+    *reinterpret_cast<bool*>(reinterpret_cast<char*>(sack) + g_sackTakenOff) = taken;
+    return true;
+}
+
 }  // namespace
 
 bool EnsureResolved() {
@@ -228,17 +286,76 @@ void RestoreTick(void* drone) {
     E::SetActorTickEnabled(drone, true);
 }
 
+void* FindSack(void* drone) {
+    if (!drone || !R::IsLive(drone) || !EnsureSackFieldsResolved()) return nullptr;
+    void* const container = ContainerOf(drone);
+    if (!container) return nullptr;
+    SackSearch search;
+    search.drone = drone;
+    search.container = container;
+    object_index::ForEachInstance(g_sackClass, &FindSackCandidate, &search);
+    return search.best;
+}
+
+bool IsSackAttached(void* drone, void* sack) {
+    if (!drone || !sack || !R::IsLive(drone) || !R::IsLive(sack) ||
+        !EnsureSackFieldsResolved()) return false;
+    const bool taken = *reinterpret_cast<const bool*>(reinterpret_cast<const char*>(sack) + g_sackTakenOff);
+    void* parent = nullptr;
+    if (E::GetAttachParentActor(sack, parent)) return parent == drone;
+    return taken;  // preserve the BP flag if this UE build does not expose GetAttachParentActor
+}
+
+bool ApplySackMirror(void* drone, bool present, bool attached, bool simulatePhysics, bool poseValid,
+                     const FVector& loc, const FRotator& rot) {
+    if (!drone || !R::IsLive(drone)) return false;
+    void* const sack = FindSack(drone);
+    if (!sack) return !present;  // an absent sack needs no actor-side work; a present one may spawn later
+
+    if (poseValid) {
+        E::SetActorLocation(sack, loc);
+        E::SetActorRotation(sack, rot);
+    }
+    if (attached) {
+        void* const root = E::RootComponentOf(drone);
+        if (!root) return false;
+        void* parent = nullptr;
+        const bool parentRead = E::GetAttachParentActor(sack, parent);
+        // Preserve the host's physics mode: some sack transitions have a short simulated phase
+        // even while the actor is attached. KeepWorld prevents a snap to the drone's origin.
+        if (!parentRead || parent != drone) {
+            E::SetActorSimulatePhysics(sack, false);
+            if (!E::AttachActorToComponentKeepWorld(sack, root)) return false;
+        }
+        E::SetActorSimulatePhysics(sack, simulatePhysics);
+        return WriteSackTaken(sack, true);
+    }
+
+    void* parent = nullptr;
+    if (E::GetAttachParentActor(sack, parent) && parent == drone) {
+        if (!E::DetachActorFromParent(sack)) return false;
+    }
+    E::SetActorSimulatePhysics(sack, simulatePhysics);
+    return WriteSackTaken(sack, false);
+}
+
 uint8_t ReadFxBits(void* drone) {
     if (!drone) return 0;
     uint8_t bits = 0;
     bool leaveAfter5min = false;
     if (ReadLeaveAfter5min(drone, leaveAfter5min) && leaveAfter5min) bits |= kFxLeaveAfter5min;
     if (EnsureGateFieldsResolved()) {
-        const auto rb = [drone](int32_t off) -> bool {
-            return off >= 0 && *reinterpret_cast<const bool*>(reinterpret_cast<const char*>(drone) + off);
-        };
-        if (rb(g_canTakeOffOff)) bits |= kFxArrived;  // parked/arrived -> the interaction gate
-        if (rb(g_hasSackOff))    bits |= kFxHasSack;  // cargo aboard -> the action-option prerequisite
+        if (g_canTakeOffOff >= 0 &&
+            *reinterpret_cast<const bool*>(reinterpret_cast<const char*>(drone) + g_canTakeOffOff))
+            bits |= kFxArrived;  // parked/arrived -> the interaction gate
+    }
+    // The Blueprint's hasSack byte can outlive the sack's physical attachment (notably after a
+    // host-authoritative drop). Use the actual shared-container actor and attach parent as the
+    // source of truth, so a bare drone never advertises a sack interaction.
+    if (void* sack = FindSack(drone)) {
+        bits |= kFxSackPresent;
+        if (IsSackAttached(drone, sack)) bits |= kFxSackAttached | kFxHasSack;
+        if (E::IsActorRootSimulatingPhysics(sack)) bits |= kFxSackSimulating;
     }
     // FX components are optional; their absence must not hide the interaction-gate state above.
     if (!EnsureFxResolved()) return bits;
@@ -323,9 +440,9 @@ void SetSignalLight(void* drone, bool on) {
 
 bool CanDropSack(void* drone) {
     if (!drone || !EnsureGateFieldsResolved()) return false;
-    const char* const bytes = reinterpret_cast<const char*>(drone);
-    return *reinterpret_cast<const bool*>(bytes + g_canTakeOffOff) &&
-           *reinterpret_cast<const bool*>(bytes + g_hasSackOff);
+    const bool parked = *reinterpret_cast<const bool*>(reinterpret_cast<const char*>(drone) + g_canTakeOffOff);
+    void* const sack = FindSack(drone);
+    return parked && sack && IsSackAttached(drone, sack);
 }
 
 bool DropSack(void* drone) {

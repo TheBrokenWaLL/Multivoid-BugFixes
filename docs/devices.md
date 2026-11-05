@@ -364,8 +364,11 @@ its own drone's setting, which every peer's copy takes from the drone's state st
 click plays on the presser's machine and on the host. Removing the parked drone's sack uses the same
 intent lane: the client cancels its local `drone_C::dropSack`, and the host resolves its own drone,
 checks the sender's reach plus `canTakeOff`/`hasSack`, then runs the Blueprint verb once. The resulting
-sack actor is mirrored by the ordinary prop lanes rather than being created independently on each peer.
-The drone and the sack must also name the same inventory actor. The drone's cooked `BeginPlay`
+sack actor's own transform and physical attachment are mirrored in `DroneState`: the client detaches
+its stale drone-mounted copy on a host drop, follows the host sack pose while it is loose, and attaches
+it to the local drone again when the host rehangs it. The host also derives the drone's `hasSack`
+interaction gate from the sack actor's actual attachment, rather than trusting a Blueprint flag that
+can remain stale after a drop. The drone and the sack must also name the same inventory actor. The drone's cooked `BeginPlay`
 looks up `droneContainer`, which misses the world container keyed `drone_InventoryContainer` and
 can leave `drone.container` pointing at a private inventory; `compileOrder` writes through that
 field, while the sack opens the keyed world container. `drone_sync` now resolves the exact keyed

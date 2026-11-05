@@ -56,6 +56,14 @@ struct DroneMirror {
     bool    haveStateBits = false;
     int8_t  hostActive = -1;      // the host's last word on Active: 1, 0, or -1 before any
     bool    leaveWriteWarned = false;  // the leave timer's failed write, said once a session
+    bool    sackSyncPending = false;   // the sack actor may load after its DroneState arrived
+    bool    sackPresent = false;
+    bool    sackAttached = false;
+    bool    sackPoseValid = false;
+    bool    sackSimulating = false;
+    FVector sackLoc{};
+    FRotator sackRot{};
+    uint64_t nextSackSyncMs = 0;
     // The newest word that arrived before this peer's drone resolved, waiting whole -- the pose and the
     // gate fields with it -- for the first tick that finds the drone.
     bool    hasPending = false;
@@ -74,6 +82,9 @@ FVector  g_sentLoc{};
 FRotator g_sentRot{};
 bool     g_sentActive = false;
 uint8_t  g_sentBits   = 0;
+bool     g_sentSackPose = false;
+FVector  g_sentSackLoc{};
+FRotator g_sentSackRot{};
 bool     g_installLogged  = false;  // latch the install log (Install is the per-tick ensure path)
 
 uint64_t NowMs() {
@@ -104,14 +115,40 @@ struct HostRead {
     FVector  loc{};
     FRotator rot{};
     bool     active = false;
-    uint8_t  bits = 0;  // bit0 rotor dust, bit1 arrived, bit2 hasSack, bit3 leaveAfter5min
+    uint8_t  bits = 0;  // FX/gates plus sack presence and physical attachment
+    bool     sackPresent = false;
+    bool     sackPoseValid = false;
+    FVector  sackLoc{};
+    FRotator sackRot{};
 };
 
 bool ReadHost(void* drone, HostRead& r) {
     if (!D::ReadPose(drone, r.loc, r.rot)) return false;
     r.active = D::IsActive(drone);
     r.bits = D::ReadFxBits(drone);
+    if (void* sack = D::FindSack(drone)) {
+        r.sackPresent = true;
+        r.sackPoseValid = D::ReadPose(sack, r.sackLoc, r.sackRot);
+    }
     return true;
+}
+
+bool SackPoseChanged(const HostRead& r) {
+    // Detached sacks have an independent physical trajectory. Stream their changed pose so the
+    // client's bag follows the same short physics motion between drop/pickup state edges. An
+    // attached sack follows the already-streamed drone transform and needs no second pose stream.
+    if (!r.sackPresent || !r.sackPoseValid || (r.bits & D::kFxSackAttached)) return false;
+    if (!g_sentSackPose) return true;
+    const float dx = r.sackLoc.X - g_sentSackLoc.X;
+    const float dy = r.sackLoc.Y - g_sentSackLoc.Y;
+    const float dz = r.sackLoc.Z - g_sentSackLoc.Z;
+    auto angleChanged = [](float a, float b) {
+        return std::fabs(ue_wrap::NormalizeAxis(a - b)) > kTurnEpsDeg;
+    };
+    return dx * dx + dy * dy + dz * dz > kMoveEpsCm * kMoveEpsCm ||
+           angleChanged(r.sackRot.Pitch, g_sentSackRot.Pitch) ||
+           angleChanged(r.sackRot.Yaw, g_sentSackRot.Yaw) ||
+           angleChanged(r.sackRot.Roll, g_sentSackRot.Roll);
 }
 
 void FillPayload(void* drone, const HostRead& r, bool adopt, coop::net::DroneStatePayload& p) {
@@ -128,6 +165,18 @@ void FillPayload(void* drone, const HostRead& r, bool adopt, coop::net::DroneSta
         FVector a;
         if (D::ReadDustAnchor(drone, a)) { p.dustX = a.X; p.dustY = a.Y; p.dustZ = a.Z; }
         else                             { p.stateBits &= ~D::kFxDust; }
+    }
+    if (r.sackPresent) {
+        p.stateBits |= D::kFxSackPresent;
+        if (r.sackPoseValid) {
+            p.stateBits |= D::kFxSackPose;
+            p.sackX = r.sackLoc.X; p.sackY = r.sackLoc.Y; p.sackZ = r.sackLoc.Z;
+            p.sackPitch = r.sackRot.Pitch; p.sackYaw = r.sackRot.Yaw; p.sackRoll = r.sackRot.Roll;
+        } else {
+            p.stateBits &= ~D::kFxSackPose;
+        }
+    } else {
+        p.stateBits &= ~(D::kFxSackPresent | D::kFxSackAttached | D::kFxSackPose | D::kFxHasSack);
     }
 }
 
@@ -205,6 +254,20 @@ void ApplyState(void* drone, const coop::net::DroneStatePayload& payload) {
     const bool hasSack    = (nb & D::kFxHasSack) != 0;
     const bool leaveAfter5min = (nb & D::kFxLeaveAfter5min) != 0;
 
+    // A sack is a separate actor, not part of drone_C's transform. Mirror its own host pose and
+    // attachment state so the client detaches the stale sack left by the cancelled local Blueprint
+    // and reattaches it when the host puts it back. Retry if the keyed container/actor loads later.
+    g_m.sackPresent = (nb & D::kFxSackPresent) != 0;
+    g_m.sackAttached = (nb & D::kFxSackAttached) != 0;
+    g_m.sackPoseValid = (nb & D::kFxSackPose) != 0;
+    g_m.sackSimulating = (nb & D::kFxSackSimulating) != 0;
+    g_m.sackLoc = FVector{payload.sackX, payload.sackY, payload.sackZ};
+    g_m.sackRot = FRotator{payload.sackPitch, payload.sackYaw, payload.sackRoll};
+    g_m.sackSyncPending = !D::ApplySackMirror(drone, g_m.sackPresent, g_m.sackAttached,
+                                              g_m.sackSimulating, g_m.sackPoseValid,
+                                              g_m.sackLoc, g_m.sackRot);
+    g_m.nextSackSyncMs = NowMs() + 250;
+
     // Interaction gate: write canTakeOff (THE gate) + hasSack (option prerequisite) onto the mirror so
     // a parked drone is interactable instead of "in motion" (the suppressed tick never sets them).
     D::WriteGateFields(drone, canTakeOff, hasSack);
@@ -247,7 +310,9 @@ void OnReliable(const coop::net::DroneStatePayload& payload) {
     if (!s) return;  // from the host alone: its receive edge refuses a client's copy
     if (!std::isfinite(payload.x) || !std::isfinite(payload.y) || !std::isfinite(payload.z) ||
         !std::isfinite(payload.pitch) || !std::isfinite(payload.yaw) || !std::isfinite(payload.roll) ||
-        !std::isfinite(payload.dustX) || !std::isfinite(payload.dustY) || !std::isfinite(payload.dustZ)) {
+        !std::isfinite(payload.dustX) || !std::isfinite(payload.dustY) || !std::isfinite(payload.dustZ) ||
+        !std::isfinite(payload.sackX) || !std::isfinite(payload.sackY) || !std::isfinite(payload.sackZ) ||
+        !std::isfinite(payload.sackPitch) || !std::isfinite(payload.sackYaw) || !std::isfinite(payload.sackRoll)) {
         UE_LOGW("drone: OnReliable non-finite pose -- dropping");
         return;
     }
@@ -271,6 +336,7 @@ void QueueConnectBroadcastForSlot(int peerSlot) {
     if (peerSlot < 0 || peerSlot >= static_cast<int>(coop::net::kMaxPeers)) return;
     void* drone = D::Find();
     if (!drone) { UE_LOGI("drone: connect-snapshot -- no drone present (skip) slot %d", peerSlot); return; }
+    BindSharedSackContainer(drone);
     HostRead r;
     if (!ReadHost(drone, r)) return;
     coop::net::DroneStatePayload p{};
@@ -302,14 +368,18 @@ void Tick() {
         g_nextCheckMs = nowMs + kSendIntervalMs;
         HostRead r;
         if (!ReadHost(drone, r)) return;
+        // The Blueprint can leave hasSack set after its sack actor has been detached. Keep the
+        // host's interaction options in lockstep with the actual physical attachment too.
+        D::WriteGateFields(drone, (r.bits & D::kFxArrived) != 0, (r.bits & D::kFxHasSack) != 0);
         const float dx = r.loc.X - g_sentLoc.X, dy = r.loc.Y - g_sentLoc.Y, dz = r.loc.Z - g_sentLoc.Z;
         const bool moved =
             !g_haveSent || dx * dx + dy * dy + dz * dz > kMoveEpsCm * kMoveEpsCm ||
             std::fabs(ue_wrap::NormalizeAxis(r.rot.Pitch - g_sentRot.Pitch)) > kTurnEpsDeg ||
             std::fabs(ue_wrap::NormalizeAxis(r.rot.Yaw - g_sentRot.Yaw)) > kTurnEpsDeg ||
             std::fabs(ue_wrap::NormalizeAxis(r.rot.Roll - g_sentRot.Roll)) > kTurnEpsDeg;
+        const bool sackMoved = SackPoseChanged(r);
         const bool streaming = r.active || (r.bits & D::kFxDust) != 0;
-        if (!streaming && !moved && r.active == g_sentActive && r.bits == g_sentBits) return;
+        if (!streaming && !moved && !sackMoved && r.active == g_sentActive && r.bits == g_sentBits) return;
         coop::net::DroneStatePayload p{};
         FillPayload(drone, r, /*adopt*/false, p);
         if (!s->SendReliable(coop::net::ReliableKind::DroneState, &p, sizeof(p))) return;
@@ -317,7 +387,9 @@ void Tick() {
         g_sentLoc = r.loc;
         g_sentRot = r.rot;
         g_sentActive = r.active;
-        g_sentBits = r.bits;  // the bits as read: FillPayload drops the dust bit when its anchor is unread
+        g_sentBits = r.bits;  // the bits as read: FillPayload drops optional FX/pose bits when unread
+        g_sentSackPose = r.sackPresent && r.sackPoseValid;
+        if (g_sentSackPose) { g_sentSackLoc = r.sackLoc; g_sentSackRot = r.sackRot; }
     } else {
         // CLIENT: the drone is ALWAYS a mirror -- suppress its own flight tick once, take a word that
         // waited for the drone to resolve, then drive the interp toward the last streamed pose (no-op
@@ -326,6 +398,12 @@ void Tick() {
         if (g_m.hasPending) {
             g_m.hasPending = false;
             ApplyState(drone, g_m.pending);
+        }
+        if (g_m.sackSyncPending && NowMs() >= g_m.nextSackSyncMs) {
+            g_m.sackSyncPending = !D::ApplySackMirror(drone, g_m.sackPresent, g_m.sackAttached,
+                                                      g_m.sackSimulating, g_m.sackPoseValid,
+                                                      g_m.sackLoc, g_m.sackRot);
+            g_m.nextSackSyncMs = NowMs() + 250;
         }
         if (g_m.hasPose) { AdvanceInterp(g_m); ApplyMirror(drone, g_m); }
     }
@@ -346,6 +424,9 @@ void OnDisconnect() {
     g_sentRot = FRotator{};
     g_sentActive = false;
     g_sentBits = 0;
+    g_sentSackPose = false;
+    g_sentSackLoc = FVector{};
+    g_sentSackRot = FRotator{};
     g_installLogged = false;
 }
 
