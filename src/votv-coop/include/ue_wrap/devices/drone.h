@@ -83,8 +83,9 @@ bool WriteLeaveAfter5min(void* drone, bool value);
 // Game thread.
 void* FindSack(void* drone);
 
-// Find another sack still mounted on this drone; `except` can skip a previously returned actor
-// so stale local copies can be retired one by one. Game thread.
+// Find another sack physically mounted on this drone, or left with an orphaned takenByDrone marker
+// and no actor parent; the latter is a cleanup candidate only, not proof of gameplay attachment.
+// `except` can skip a previously returned actor so stale local copies can be retired one by one. GT.
 void* FindAttachedSack(void* drone, void* except = nullptr);
 
 // Rebind a sack's opener field to the exact inventory actor used by the drone. This repairs the

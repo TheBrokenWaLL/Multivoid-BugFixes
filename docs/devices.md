@@ -373,9 +373,12 @@ inventory actor as the drone so `openPropInv` continues to work after an actor i
 The host derives the drone's `hasSack` interaction gate from the sack actor's actual attachment when
 that actor is positively found, while preserving the Blueprint value if the actor is not yet resolvable.
 A post hook reconciles the completed host drop: it detaches any leftover drone-owned sack actors,
-restores query collision for the look-at/hold interaction, and clears a stale socket gate. The client
-honours an explicit host `sackPresent=false` as authoritative, retires stale mounted copies once the
-host actor is known, and defers transform/attachment writes while the local player owns the sack.
+restores query collision for the look-at/hold interaction, and clears a stale socket gate. The cleanup
+scan also catches a local sack left with `takenByDrone=true` but no readable actor-parent edge; this is
+a retirement candidate only and never enables the gameplay attachment gate, which still requires a
+confirmed drone parent. The client honours an explicit host `sackPresent=false` as authoritative,
+retires stale mounted copies once the host actor is known, and defers transform/attachment writes
+while the local player owns the sack.
 Detached mirrors restore actor-level and root query collision so the normal E-to-pick-up path remains
 available. The drone and the sack must also name the same inventory actor. The drone's cooked `BeginPlay`
 looks up `droneContainer`, which misses the world container keyed `drone_InventoryContainer` and

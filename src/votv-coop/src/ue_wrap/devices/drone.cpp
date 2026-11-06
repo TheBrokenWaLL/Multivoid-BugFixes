@@ -185,7 +185,8 @@ struct SackSearch {
     void* exclude = nullptr;
     void* best = nullptr;
     bool attachedOnly = false;
-    bool bestAttached = false;
+    bool includeOrphanedMountFlags = false; // cleanup scans only; never the normal sack resolver
+    int bestAttachmentRank = 0; // 3=physical parent, 2=orphaned takenByDrone marker
     bool bestContainerMatch = false;
     float bestDistanceSq = 1.0e30f;
 };
@@ -203,10 +204,15 @@ void FindSackCandidate(void* raw, void* sack, int32_t) {
     const bool taken = *reinterpret_cast<const bool*>(bytes + g_sackTakenOff);
     void* parent = nullptr;
     const bool parentRead = E::GetAttachParentActor(sack, parent);
-    // The physical parent is authoritative whenever the engine can answer. In particular, a
-    // stale takenByDrone flag must not keep a phantom socket interaction alive after a drop.
+    // GetAttachParentActor can successfully return nullptr for a sack that the Blueprint still
+    // marks as mounted (the sack may be held at the drone socket by takenByDrone rather than by an
+    // actor-parent edge). Keep that actor in the cleanup candidate set so the client can retire its
+    // save-loaded visual twin. Do NOT use this fallback for the gameplay attachment gate:
+    // IsSackAttached deliberately remains strict and trusts a readable physical parent.
     const bool attached = parentRead ? parent == search.drone : taken;
-    if (search.attachedOnly ? !attached : (!containerMatch && !attached)) return;
+    const bool orphanedMountFlag = search.includeOrphanedMountFlags && parentRead && parent == nullptr && taken;
+    const bool attachedCandidate = attached || orphanedMountFlag;
+    if (search.attachedOnly ? !attachedCandidate : (!containerMatch && !attachedCandidate)) return;
 
     FVector loc{};
     float distanceSq = 0.f;
@@ -217,12 +223,14 @@ void FindSackCandidate(void* raw, void* sack, int32_t) {
             distanceSq = dx * dx + dy * dy + dz * dz;
         }
     }
-    // Prefer attached actors, then actors already bound to the shared inventory, then proximity.
-    const int rank = (attached ? 2 : 0) + (containerMatch ? 1 : 0);
-    const int bestRank = (search.bestAttached ? 2 : 0) + (search.bestContainerMatch ? 1 : 0);
+    // Prefer physically attached actors, then orphaned mount markers (cleanup only), then actors
+    // already bound to the shared inventory, then proximity. The strict IsSackAttached query below
+    // is unchanged, so a stale marker can never enable the drone's drop/interaction option.
+    const int rank = (attached ? 3 : (orphanedMountFlag ? 2 : 0)) + (containerMatch ? 1 : 0);
+    const int bestRank = search.bestAttachmentRank + (search.bestContainerMatch ? 1 : 0);
     if (!search.best || rank > bestRank || (rank == bestRank && distanceSq < search.bestDistanceSq)) {
         search.best = sack;
-        search.bestAttached = attached;
+        search.bestAttachmentRank = attached ? 3 : (orphanedMountFlag ? 2 : 0);
         search.bestContainerMatch = containerMatch;
         search.bestDistanceSq = distanceSq;
     }
@@ -309,6 +317,7 @@ void* FindAttachedSack(void* drone, void* except) {
     search.container = ContainerOf(drone);
     search.exclude = except;
     search.attachedOnly = true;
+    search.includeOrphanedMountFlags = true;
     object_index::ForEachInstance(g_sackClass, &FindSackCandidate, &search);
     return search.best;
 }
@@ -319,11 +328,17 @@ void* FindSack(void* drone) {
         g_sackOwnerDrone.Set(drone);
         g_sackActor.Reset();
     }
-    // Prefer a sack physically mounted on this drone. During the drop graph, fall back to the
-    // last known actor even if the Blueprint temporarily clears its container/key relationship.
-    if (void* attached = FindAttachedSack(drone)) {
-        if (!g_sackActor.Is(attached)) g_sackActor.Set(attached);
-        return attached;
+    // Prefer a sack physically mounted on this drone. This normal resolver deliberately excludes
+    // orphaned takenByDrone markers: those are discovered only by the cleanup scans below, so a
+    // stale local visual can never win over the authoritative dropped actor.
+    SackSearch mountedSearch;
+    mountedSearch.drone = drone;
+    mountedSearch.container = ContainerOf(drone);
+    mountedSearch.attachedOnly = true;
+    object_index::ForEachInstance(g_sackClass, &FindSackCandidate, &mountedSearch);
+    if (mountedSearch.best) {
+        if (!g_sackActor.Is(mountedSearch.best)) g_sackActor.Set(mountedSearch.best);
+        return mountedSearch.best;
     }
     if (void* cached = g_sackActor.Get()) return cached;
 
