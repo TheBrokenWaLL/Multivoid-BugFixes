@@ -9,6 +9,7 @@
 #include "ue_wrap/devices/drone.h"
 
 #include "ue_wrap/core/call.h"
+#include "ue_wrap/core/cached_obj_ref.h"
 #include "ue_wrap/engine/engine.h"
 #include "ue_wrap/core/fname_utils.h"
 #include "ue_wrap/core/log.h"
@@ -163,6 +164,10 @@ void ActivateComponent(void* comp) {
 void* g_sackClass = nullptr;
 int32_t g_sackContainerOff = -1;
 int32_t g_sackTakenOff = -1;
+// The Blueprint may clear/rebind the sack container during dropSack. Keep a slot-validated
+// reference to the drone's current sack so the host can still publish its detached actor.
+CachedObjRef g_sackOwnerDrone;
+CachedObjRef g_sackActor;
 
 bool EnsureSackFieldsResolved() {
     if (!g_sackClass) g_sackClass = object_index::ClassByName(L"prop_dronesack_C");
@@ -177,7 +182,9 @@ bool EnsureSackFieldsResolved() {
 struct SackSearch {
     void* drone = nullptr;
     void* container = nullptr;
+    void* exclude = nullptr;
     void* best = nullptr;
+    bool attachedOnly = false;
     bool bestAttached = false;
     bool bestContainerMatch = false;
     float bestDistanceSq = 1.0e30f;
@@ -185,7 +192,7 @@ struct SackSearch {
 
 void FindSackCandidate(void* raw, void* sack, int32_t) {
     auto& search = *static_cast<SackSearch*>(raw);
-    if (!sack || !R::IsLive(sack)) return;
+    if (!sack || sack == search.exclude || !R::IsLive(sack)) return;
     const auto* bytes = reinterpret_cast<const uint8_t*>(sack);
     void* const container = *reinterpret_cast<void* const*>(bytes + g_sackContainerOff);
     const bool containerMatch = search.container && container == search.container;
@@ -196,8 +203,10 @@ void FindSackCandidate(void* raw, void* sack, int32_t) {
     const bool taken = *reinterpret_cast<const bool*>(bytes + g_sackTakenOff);
     void* parent = nullptr;
     const bool parentRead = E::GetAttachParentActor(sack, parent);
+    // The physical parent is authoritative whenever the engine can answer. In particular, a
+    // stale takenByDrone flag must not keep a phantom socket interaction alive after a drop.
     const bool attached = parentRead ? parent == search.drone : taken;
-    if (!containerMatch && !attached) return;
+    if (search.attachedOnly ? !attached : (!containerMatch && !attached)) return;
 
     FVector loc{};
     float distanceSq = 0.f;
@@ -293,12 +302,36 @@ void RestoreTick(void* drone) {
     E::SetActorTickEnabled(drone, true);
 }
 
-void* FindSack(void* drone) {
+void* FindAttachedSack(void* drone, void* except) {
     if (!drone || !R::IsLive(drone) || !EnsureSackFieldsResolved()) return nullptr;
     SackSearch search;
     search.drone = drone;
     search.container = ContainerOf(drone);
+    search.exclude = except;
+    search.attachedOnly = true;
     object_index::ForEachInstance(g_sackClass, &FindSackCandidate, &search);
+    return search.best;
+}
+
+void* FindSack(void* drone) {
+    if (!drone || !R::IsLive(drone) || !EnsureSackFieldsResolved()) return nullptr;
+    if (!g_sackOwnerDrone.Is(drone)) {
+        g_sackOwnerDrone.Set(drone);
+        g_sackActor.Reset();
+    }
+    // Prefer a sack physically mounted on this drone. During the drop graph, fall back to the
+    // last known actor even if the Blueprint temporarily clears its container/key relationship.
+    if (void* attached = FindAttachedSack(drone)) {
+        if (!g_sackActor.Is(attached)) g_sackActor.Set(attached);
+        return attached;
+    }
+    if (void* cached = g_sackActor.Get()) return cached;
+
+    SackSearch search;
+    search.drone = drone;
+    search.container = ContainerOf(drone);
+    object_index::ForEachInstance(g_sackClass, &FindSackCandidate, &search);
+    if (search.best) g_sackActor.Set(search.best);
     return search.best;
 }
 
@@ -321,7 +354,7 @@ bool IsSackAttached(void* drone, void* sack) {
     const bool taken = *reinterpret_cast<const bool*>(reinterpret_cast<const char*>(sack) + g_sackTakenOff);
     void* parent = nullptr;
     if (E::GetAttachParentActor(sack, parent)) return parent == drone;
-    return taken;  // preserve the BP flag if this UE build does not expose GetAttachParentActor
+    return taken;  // use the Blueprint flag only when the engine cannot read the parent edge
 }
 
 bool ApplySackMirror(void* drone, void* sack, bool present, bool attached, bool simulatePhysics,
@@ -339,6 +372,7 @@ bool ApplySackMirror(void* drone, void* sack, bool present, bool attached, bool 
         // state edge corrects the world transform once, then the actor follows the drone root.
         void* parent = nullptr;
         const bool parentRead = E::GetAttachParentActor(sack, parent);
+        if (parentRead && parent && parent != drone) return false; // preserve a locally owned prop
         if (!parentRead || parent != drone) {
             void* const root = E::RootComponentOf(drone);
             if (!root) return false;
@@ -349,21 +383,28 @@ bool ApplySackMirror(void* drone, void* sack, bool present, bool attached, bool 
             E::SetActorLocation(sack, loc);
             E::SetActorRotation(sack, rot);
         }
+        E::SetActorEnableCollision(sack, true);
+        E::SetActorRootCollisionEnabled(sack, 3); // QueryAndPhysics
         E::SetActorSimulatePhysics(sack, simulatePhysics);
         return WriteSackTaken(sack, true);
     }
 
-    // Detach whenever the actor is still parented (or the parent query is unavailable). A
-    // readable null parent already means it is loose and must not be detached again.
+    // A detached mirror must remain grabbable with E. Only detach from this drone; never steal a
+    // sack currently parented to the local player/another owner. Restore actor + root query collision
+    // because the Blueprint drop graph is intentionally suppressed on clients.
     void* parent = nullptr;
     const bool parentRead = E::GetAttachParentActor(sack, parent);
-    if (!parentRead || parent) {
-        if (!E::DetachActorFromParent(sack)) return false;
-    }
+    const bool taken = *reinterpret_cast<const bool*>(
+        reinterpret_cast<const char*>(sack) + g_sackTakenOff);
+    if (parentRead && parent == drone && !E::DetachActorFromParent(sack)) return false;
+    if (!parentRead && taken && !E::DetachActorFromParent(sack)) return false;
+    if (parentRead && parent && parent != drone) return WriteSackTaken(sack, false);
     if (poseValid) {
         E::SetActorLocation(sack, loc);
         E::SetActorRotation(sack, rot);
     }
+    E::SetActorEnableCollision(sack, true);
+    E::SetActorRootCollisionEnabled(sack, 3); // QueryAndPhysics
     E::SetActorSimulatePhysics(sack, simulatePhysics);
     return WriteSackTaken(sack, false);
 }
@@ -475,9 +516,47 @@ void SetSignalLight(void* drone, bool on) {
 
 bool CanDropSack(void* drone) {
     if (!drone || !EnsureGateFieldsResolved()) return false;
-    const bool parked = *reinterpret_cast<const bool*>(reinterpret_cast<const char*>(drone) + g_canTakeOffOff);
+    const char* const bytes = reinterpret_cast<const char*>(drone);
+    const bool parked = *reinterpret_cast<const bool*>(bytes + g_canTakeOffOff);
+    const bool blueprintHasSack = *reinterpret_cast<const bool*>(bytes + g_hasSackOff);
     void* const sack = FindSack(drone);
-    return parked && sack && IsSackAttached(drone, sack);
+    // Let the authoritative Blueprint complete its own drop transition when its interaction gate
+    // says the sack is mounted, even if the actor-parent query is momentarily stale/unavailable.
+    return parked && (blueprintHasSack || (sack && IsSackAttached(drone, sack)));
+}
+
+void NormalizeDroppedSack(void* drone) {
+    if (!drone || !R::IsLive(drone) || !EnsureGateFieldsResolved() || !EnsureSackFieldsResolved()) return;
+    // A stale mount can coexist with the actor the Blueprint just dropped. Detach every remaining
+    // drone-owned sack, but never detach an actor with a different live parent (a player hold).
+    void* except = nullptr;
+    for (int i = 0; i < 8; ++i) {
+        void* const sack = FindAttachedSack(drone, except);
+        if (!sack) break;
+        except = sack;
+        void* parent = nullptr;
+        const bool parentRead = E::GetAttachParentActor(sack, parent);
+        const bool taken = *reinterpret_cast<const bool*>(
+            reinterpret_cast<const char*>(sack) + g_sackTakenOff);
+        bool released = false;
+        if (parentRead && parent == drone) released = E::DetachActorFromParent(sack);
+        else if (!parentRead && taken) released = E::DetachActorFromParent(sack);
+        else if (parentRead && parent == nullptr) released = true;
+        if (!released && (!parentRead || parent == drone))
+            UE_LOGW("drone: dropSack post-hook could not detach sack %p", sack);
+        WriteSackTaken(sack, false);
+        E::SetActorEnableCollision(sack, true);
+        E::SetActorRootCollisionEnabled(sack, 3); // QueryAndPhysics
+        if (released) E::SetActorSimulatePhysics(sack, true);
+        UE_LOGI("drone: normalized dropped sack actor %p (released=%d)", sack, released ? 1 : 0);
+    }
+    // The Blueprint can leave this gate true after the sack actor leaves the socket. The host is
+    // authoritative for the completed drop, so clear only this interaction prerequisite.
+    *reinterpret_cast<bool*>(reinterpret_cast<char*>(drone) + g_hasSackOff) = false;
+    // Do not let the pre-drop actor be reused as the authoritative post-drop sack if the Blueprint
+    // destroyed/replaced it or cleared its inventory binding. The normal prop lane/key census can
+    // discover the resulting world actor independently on the next host read.
+    g_sackActor.Reset();
 }
 
 bool DropSack(void* drone) {

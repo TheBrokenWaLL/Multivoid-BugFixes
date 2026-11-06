@@ -70,6 +70,7 @@ struct Slot {
     bool     waitSaid  = false;  // a wait for the body, said once a streak
 };
 sg::Verdict OnDropSackPre(const sg::Call& call);
+void OnDropSackPost(const sg::Call& call);
 
 coop::roster_ledger::PerSlotState<Slot> g_slots;
 
@@ -79,7 +80,7 @@ bool EnsureDropSackWatch() {
     if (!droneClass) return false;
     const auto fn = ue_wrap::facts::ResolveOn(kRowDropSack, droneClass);
     if (!fn) return false;
-    g_dropSackWatchInstalled = sg::Watch(fn, kTagDropSack, &OnDropSackPre, nullptr);
+    g_dropSackWatchInstalled = sg::Watch(fn, kTagDropSack, &OnDropSackPre, &OnDropSackPost);
     if (g_dropSackWatchInstalled)
         UE_LOGI("[DRONE-CALL] the drone sack-drop gate is live");
     return g_dropSackWatchInstalled;
@@ -268,6 +269,15 @@ sg::Verdict OnDropSackPre(const sg::Call& call) {
         UE_LOGI("[DRONE-CALL] CLIENT SENT sack-drop request (#%llu)",
                 static_cast<unsigned long long>(g_dropSacksSent));
     return sg::Verdict::Cancel;
+}
+
+// The client cancels the local Blueprint body to prevent a second world sack. Once the host's
+// original body returns, reconcile the actor attachment/collision and clear a stale socket outline.
+void OnDropSackPost(const sg::Call& call) {
+    auto* s = g_session.load(std::memory_order_acquire);
+    if (!s || !s->connected() || s->role() != coop::net::Role::Host || !call.object) return;
+    if (call.object != ue_wrap::drone::Find()) return;
+    ue_wrap::drone::NormalizeDroppedSack(call.object);
 }
 
 }  // namespace

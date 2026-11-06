@@ -83,14 +83,17 @@ bool WriteLeaveAfter5min(void* drone, bool value);
 // Game thread.
 void* FindSack(void* drone);
 
+// Find another sack still mounted on this drone; `except` can skip a previously returned actor
+// so stale local copies can be retired one by one. Game thread.
+void* FindAttachedSack(void* drone, void* except = nullptr);
+
 // Rebind a sack's opener field to the exact inventory actor used by the drone. This repairs the
 // BeginPlay/key lookup on an already-existing or adopted sack so openPropInv remains usable.
 // Game thread.
 bool SetSackContainer(void* drone, void* sack);
 
-// Read the sack's attachment state. The actor's takenByDrone flag is cross-checked against its
-// actual attach parent when that query is available, so a stale flag cannot leave a phantom drone
-// interaction enabled. Game thread.
+// Read the sack's attachment state. The physical attach parent wins whenever the engine can
+// read it, so a stale takenByDrone flag cannot leave a phantom drone interaction enabled. Game thread.
 bool IsSackAttached(void* drone, void* sack);
 
 // CLIENT mirror: apply the host's state to the EXACT sack actor resolved by the host element id/key.
@@ -129,6 +132,9 @@ void WriteGateFields(void* drone, bool canTakeOff, bool hasSack);
 // Whether the drone is parked with its sack physically attached. Does not trust a stale hasSack
 // Blueprint byte and does not depend on the optional FX components. Game thread.
 bool CanDropSack(void* drone);
+// HOST post-drop reconciliation: release any stale drone-owned sack actors, restore their query
+// collision and clear the Blueprint's stale hasSack interaction gate. Game thread.
+void NormalizeDroppedSack(void* drone);
 
 // Run the drone's own dropSack Blueprint verb. The multiplayer intent lane calls this on the host
 // after checking the sender's reach and the drone's state. Game thread.

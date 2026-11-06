@@ -16,6 +16,7 @@
 #include "coop/net/protocol.h"
 #include "coop/net/session.h"
 #include "coop/props/prop_key_index.h"
+#include "coop/props/remote_prop.h"
 
 #include "ue_wrap/devices/drone.h"
 #include "ue_wrap/actors/prop.h"
@@ -259,7 +260,10 @@ void ApplyMirror(void* drone, DroneMirror& e) {
     e.dirty = false;
 }
 
-void* ResolveSackActor(const DroneMirror& e) {
+void* ResolveSackActor(void* drone, const DroneMirror& e) {
+    // Host absence is authoritative. Falling back to a save-loaded mounted client sack here would
+    // resurrect the visual ghost after the host has already dropped/removed it.
+    if (!e.sackPresent) return nullptr;
     if (e.sackEid != 0 && e.sackEid != coop::element::kInvalidId) {
         if (void* actor = coop::element::LivePropActor(e.sackEid)) return actor;
     }
@@ -270,7 +274,30 @@ void* ResolveSackActor(const DroneMirror& e) {
             key.push_back(static_cast<wchar_t>(static_cast<unsigned char>(e.sackKey.data[i])));
         if (void* actor = coop::prop_key_index::Find(key)) return actor;
     }
-    return nullptr;
+    // No network identity yet (e.g. a save-native sack without a Key/EID): reuse the local sack
+    // only while the host explicitly says one exists.
+    return drone ? D::FindSack(drone) : nullptr;
+}
+
+void RetireStaleMountedSacks(void* drone, void* authoritativeSack, bool hostAttached) {
+    if (!drone) return;
+    // When the host says the sack is still mounted but its exact actor has not loaded yet, do not
+    // destroy the local candidate. Once the authoritative actor is known, remove every other
+    // mounted twin. If the host says it is detached/absent, the old local socket actor is stale.
+    if (hostAttached && !authoritativeSack) return;
+    void* exclude = authoritativeSack;
+    for (int i = 0; i < 8; ++i) {
+        void* const mounted = D::FindAttachedSack(drone, exclude);
+        if (!mounted) break;
+        exclude = mounted;
+        if (coop::remote_prop::IsOwnedHere(mounted)) continue; // never steal a local player's hold
+        const auto eid = coop::remote_prop::ResolveMirrorEidByActor(mounted, /*wireMirrorOnly=*/true);
+        if (eid != coop::element::kInvalidId) coop::remote_prop::UnregisterPropMirror(eid);
+        coop::remote_prop::ClearAnyDriveFor(mounted);
+        UE_LOGW("drone: retiring stale client-mounted sack %p; authoritative=%p attached=%d",
+                mounted, authoritativeSack, hostAttached ? 1 : 0);
+        coop::remote_prop::ConsumeLocalActor(mounted);
+    }
 }
 
 }  // namespace
@@ -314,9 +341,17 @@ void ApplyState(void* drone, const coop::net::DroneStatePayload& payload) {
     g_m.sackKey = payload.sackKey;
     g_m.sackLoc = FVector{payload.sackX, payload.sackY, payload.sackZ};
     g_m.sackRot = FRotator{payload.sackPitch, payload.sackYaw, payload.sackRoll};
-    g_m.sackSyncPending = !D::ApplySackMirror(drone, ResolveSackActor(g_m), g_m.sackPresent,
-                                              g_m.sackAttached, g_m.sackSimulating,
-                                              g_m.sackPoseValid, g_m.sackLoc, g_m.sackRot);
+    void* const sack = ResolveSackActor(drone, g_m);
+    RetireStaleMountedSacks(drone, sack, g_m.sackAttached);
+    if (sack && coop::remote_prop::IsOwnedHere(sack)) {
+        // The local grab/drive owns the actor until release; don't attach or teleport it out of
+        // the player's hands just because an older DroneState packet is still in flight.
+        g_m.sackSyncPending = true;
+    } else {
+        g_m.sackSyncPending = !D::ApplySackMirror(drone, sack, g_m.sackPresent,
+                                                  g_m.sackAttached, g_m.sackSimulating,
+                                                  g_m.sackPoseValid, g_m.sackLoc, g_m.sackRot);
+    }
     g_m.nextSackSyncMs = NowMs() + 250;
 
     // Interaction gate: write canTakeOff (THE gate) + hasSack (option prerequisite) onto the mirror so
@@ -457,9 +492,15 @@ void Tick() {
             ApplyState(drone, g_m.pending);
         }
         if (g_m.sackSyncPending && NowMs() >= g_m.nextSackSyncMs) {
-            g_m.sackSyncPending = !D::ApplySackMirror(drone, ResolveSackActor(g_m), g_m.sackPresent,
-                                                      g_m.sackAttached, g_m.sackSimulating,
-                                                      g_m.sackPoseValid, g_m.sackLoc, g_m.sackRot);
+            void* const sack = ResolveSackActor(drone, g_m);
+            RetireStaleMountedSacks(drone, sack, g_m.sackAttached);
+            if (sack && coop::remote_prop::IsOwnedHere(sack)) {
+                g_m.sackSyncPending = true;
+            } else {
+                g_m.sackSyncPending = !D::ApplySackMirror(drone, sack, g_m.sackPresent,
+                                                          g_m.sackAttached, g_m.sackSimulating,
+                                                          g_m.sackPoseValid, g_m.sackLoc, g_m.sackRot);
+            }
             g_m.nextSackSyncMs = NowMs() + 250;
         }
         if (g_m.hasPose) { AdvanceInterp(g_m); ApplyMirror(drone, g_m); }
