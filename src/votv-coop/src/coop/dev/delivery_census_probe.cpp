@@ -17,6 +17,8 @@
 #include "coop/dev/delivery_census_probe.h"
 
 #include "coop/element/registry.h"
+#include "coop/player/players_registry.h"
+#include "coop/props/remote_prop.h"
 #include "coop/net/session.h"
 #include "coop/config/config.h"
 #include "ue_wrap/actors/inventory.h"    // ResolveSaveSlot
@@ -25,11 +27,13 @@
 #include "ue_wrap/actors/save_record.h"  // Arr / ReadArr / kMxStride
 #include "ue_wrap/core/log.h"
 #include "ue_wrap/core/reflection.h"
+#include "ue_wrap/core/sdk_profile.h"
 
 #include <chrono>
 #include <cstdint>
 #include <cstring>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace coop::dev::delivery_census {
@@ -37,6 +41,8 @@ namespace {
 
 namespace R  = ue_wrap::reflection;
 namespace SR = ue_wrap::save_record;
+namespace E  = ue_wrap::engine;
+namespace P  = ue_wrap::profile;
 
 constexpr uint64_t kSampleMs = 2000;
 
@@ -48,6 +54,8 @@ uint64_t NowMs() {
 
 uint64_t g_nextSample = 0;
 uint64_t g_lastHash = 0;
+uint64_t g_lastSackDiagHash = 0;
+bool g_sackDiagFirst = true;
 
 // Per-GObjStack-slot occupancy from the previous sample. The census answered Q-A and Q-B but
 // exposed a fact it could not explain: on the host a delivery landed (slot count 0 -> 2) and the
@@ -122,6 +130,244 @@ void FillCommon(Row& r) {
     r.x = loc.X; r.y = loc.Y; r.z = loc.Z;
 }
 
+
+// The sack visual can survive as a component of drone_C rather than as a second
+// prop_dronesack_C actor. This read-only census distinguishes those cases before
+// another actor-destruction rule is attempted.
+uint64_t MixDiag(uint64_t h, uint64_t value) {
+    h ^= value;
+    return h * 1099511628211ull;
+}
+
+uint64_t MixText(uint64_t h, const std::wstring& value) {
+    for (wchar_t ch : value) h = MixDiag(h, static_cast<uint64_t>(ch));
+    return MixDiag(h, value.size());
+}
+
+struct ComponentDiag {
+    void* object = nullptr;
+    std::wstring name;
+    std::wstring cls;
+    void* attachParent = nullptr;
+    void* parentOwner = nullptr;
+    void* meshAsset = nullptr;
+    std::wstring meshName;
+    void* childActor = nullptr;
+    std::wstring childActorName;
+    std::wstring childActorClass;
+    uint8_t visByte = 0;
+    uint8_t hiddenByte = 0;
+};
+
+struct DroneDiag {
+    void* actor = nullptr;
+    std::wstring name;
+    void* container = nullptr;
+    bool hasSack = false;
+    bool canTakeOff = false;
+    std::vector<ComponentDiag> components;
+};
+
+struct SackDiag {
+    void* actor = nullptr;
+    std::wstring name;
+    std::wstring cls;
+    std::wstring key;
+    void* container = nullptr;
+    void* parent = nullptr;
+    bool parentRead = false;
+    bool taken = false;
+    uint32_t eid = 0;
+    uint32_t mirrorEid = 0;
+    void* root = nullptr;
+    void* rootAttachParent = nullptr;
+    void* rootParentOwner = nullptr;
+    uint8_t rootVisByte = 0;
+    uint8_t rootHiddenByte = 0;
+    int rootCollision = -1;
+    bool simulating = false;
+    bool locRead = false;
+    ue_wrap::FVector loc{};
+    bool heldByLocal = false;
+};
+
+void EmitDroneSackDiagnostic(bool isHost, const std::vector<void*>& drones,
+                             const std::vector<void*>& sacks) {
+    std::vector<DroneDiag> droneRows;
+    std::vector<SackDiag> sackRows;
+    const int32_t sceneParentOff = static_cast<int32_t>(P::off::USceneComponent_AttachParent);
+    void* sceneBase = R::FindClass(L"SceneComponent");
+    void* sceneBases[] = {sceneBase};
+
+    uint64_t hash = 1469598103934665603ull;
+    hash = MixDiag(hash, isHost ? 1u : 0u);
+    hash = MixDiag(hash, drones.size());
+    hash = MixDiag(hash, sacks.size());
+
+    for (void* drone : drones) {
+        if (!drone || !R::IsLive(drone)) continue;
+        DroneDiag d;
+        d.actor = drone;
+        d.name = R::ToString(R::NameOf(drone));
+        void* cls = R::ClassOf(drone);
+        const int32_t offContainer = Off(cls, L"container");
+        const int32_t offHasSack = Off(cls, L"hasSack");
+        const int32_t offCanTakeOff = Off(cls, L"canTakeOff");
+        if (offContainer >= 0) d.container = ReadAt<void*>(drone, offContainer);
+        if (offHasSack >= 0) d.hasSack = ReadAt<uint8_t>(drone, offHasSack) != 0;
+        if (offCanTakeOff >= 0) d.canTakeOff = ReadAt<uint8_t>(drone, offCanTakeOff) != 0;
+
+        if (sceneBase) {
+            for (const auto& child : R::ChildObjectsOf(drone)) {
+                if (!child.object || !R::IsLive(child.object) ||
+                    !R::IsDescendantOfAny(R::ClassOf(child.object), sceneBases, 16)) continue;
+                ComponentDiag c;
+                c.object = child.object;
+                c.name = child.name;
+                c.cls = child.className;
+                c.attachParent = ReadAt<void*>(child.object, sceneParentOff);
+                if (c.attachParent && R::IsLive(c.attachParent))
+                    c.parentOwner = R::OuterOf(c.attachParent);
+                c.visByte = ReadAt<uint8_t>(child.object,
+                    static_cast<int32_t>(P::off::USceneComponent_VisFlagsByte));
+                c.hiddenByte = ReadAt<uint8_t>(child.object,
+                    static_cast<int32_t>(P::off::USceneComponent_HiddenFlagsByte));
+                const int32_t meshOff = Off(R::ClassOf(child.object), L"StaticMesh");
+                const int32_t skeletalOff = Off(R::ClassOf(child.object), L"SkeletalMesh");
+                if (meshOff >= 0) c.meshAsset = ReadAt<void*>(child.object, meshOff);
+                if (!c.meshAsset && skeletalOff >= 0)
+                    c.meshAsset = ReadAt<void*>(child.object, skeletalOff);
+                if (c.meshAsset && R::IsLive(c.meshAsset))
+                    c.meshName = R::ToString(R::NameOf(c.meshAsset));
+                const int32_t childActorOff = Off(R::ClassOf(child.object), L"ChildActor");
+                if (childActorOff >= 0) {
+                    c.childActor = ReadAt<void*>(child.object, childActorOff);
+                    if (c.childActor && R::IsLive(c.childActor)) {
+                        c.childActorName = R::ToString(R::NameOf(c.childActor));
+                        c.childActorClass = R::ClassNameOf(c.childActor);
+                    } else {
+                        c.childActor = nullptr;
+                    }
+                }
+                hash = MixDiag(hash, reinterpret_cast<uintptr_t>(c.object));
+                hash = MixDiag(hash, reinterpret_cast<uintptr_t>(c.attachParent));
+                hash = MixDiag(hash, reinterpret_cast<uintptr_t>(c.parentOwner));
+                hash = MixDiag(hash, reinterpret_cast<uintptr_t>(c.meshAsset));
+                hash = MixDiag(hash, reinterpret_cast<uintptr_t>(c.childActor));
+                hash = MixText(hash, c.childActorName);
+                hash = MixText(hash, c.childActorClass);
+                hash = MixDiag(hash, c.visByte);
+                hash = MixDiag(hash, c.hiddenByte);
+                hash = MixText(hash, c.name);
+                hash = MixText(hash, c.cls);
+                hash = MixText(hash, c.meshName);
+                d.components.push_back(std::move(c));
+            }
+        }
+        hash = MixDiag(hash, reinterpret_cast<uintptr_t>(d.actor));
+        hash = MixDiag(hash, reinterpret_cast<uintptr_t>(d.container));
+        hash = MixDiag(hash, d.hasSack ? 1u : 0u);
+        hash = MixDiag(hash, d.canTakeOff ? 1u : 0u);
+        hash = MixText(hash, d.name);
+        droneRows.push_back(std::move(d));
+    }
+
+    void* localPlayer = coop::players::Registry::Get().Local();
+    for (void* sack : sacks) {
+        if (!sack || !R::IsLive(sack)) continue;
+        SackDiag r;
+        r.actor = sack;
+        r.name = R::ToString(R::NameOf(sack));
+        r.cls = R::ClassNameOf(sack);
+        r.key = ue_wrap::prop::GetKeyString(sack);
+        void* cls = R::ClassOf(sack);
+        const int32_t offContainer = Off(cls, L"container");
+        const int32_t offTaken = Off(cls, L"takenByDrone");
+        if (offContainer >= 0) r.container = ReadAt<void*>(sack, offContainer);
+        if (offTaken >= 0) r.taken = ReadAt<uint8_t>(sack, offTaken) != 0;
+        r.parentRead = E::GetAttachParentActor(sack, r.parent);
+        const auto id = coop::element::Registry::Get().EidForActor(sack);
+        if (id != coop::element::kInvalidId) r.eid = static_cast<uint32_t>(id);
+        const auto mirrorId = coop::remote_prop::ResolveMirrorEidByActor(sack, true);
+        if (mirrorId != coop::element::kInvalidId) r.mirrorEid = static_cast<uint32_t>(mirrorId);
+        r.root = E::RootComponentOf(sack);
+        if (r.root && R::IsLive(r.root)) {
+            r.rootAttachParent = ReadAt<void*>(r.root, sceneParentOff);
+            if (r.rootAttachParent && R::IsLive(r.rootAttachParent))
+                r.rootParentOwner = R::OuterOf(r.rootAttachParent);
+            r.rootVisByte = ReadAt<uint8_t>(r.root,
+                static_cast<int32_t>(P::off::USceneComponent_VisFlagsByte));
+            r.rootHiddenByte = ReadAt<uint8_t>(r.root,
+                static_cast<int32_t>(P::off::USceneComponent_HiddenFlagsByte));
+        }
+        r.rootCollision = E::GetActorRootCollisionEnabled(sack);
+        r.simulating = E::IsActorRootSimulatingPhysics(sack);
+        r.locRead = E::TryGetActorLocation(sack, r.loc);
+        r.heldByLocal = localPlayer && E::IsMainPlayerGrabbing(localPlayer, sack);
+
+        hash = MixDiag(hash, reinterpret_cast<uintptr_t>(r.actor));
+        hash = MixDiag(hash, reinterpret_cast<uintptr_t>(r.container));
+        hash = MixDiag(hash, reinterpret_cast<uintptr_t>(r.parent));
+        hash = MixDiag(hash, r.parentRead ? 1u : 0u);
+        hash = MixDiag(hash, r.taken ? 1u : 0u);
+        hash = MixDiag(hash, r.eid);
+        hash = MixDiag(hash, r.mirrorEid);
+        hash = MixDiag(hash, reinterpret_cast<uintptr_t>(r.rootAttachParent));
+        hash = MixDiag(hash, reinterpret_cast<uintptr_t>(r.rootParentOwner));
+        hash = MixDiag(hash, r.rootVisByte);
+        hash = MixDiag(hash, r.rootHiddenByte);
+        hash = MixDiag(hash, static_cast<uint64_t>(r.rootCollision + 1));
+        hash = MixDiag(hash, r.simulating ? 1u : 0u);
+        hash = MixDiag(hash, r.heldByLocal ? 1u : 0u);
+        if (r.locRead) {
+            hash = MixDiag(hash, static_cast<uint64_t>(static_cast<int64_t>(r.loc.X * 10.0f)));
+            hash = MixDiag(hash, static_cast<uint64_t>(static_cast<int64_t>(r.loc.Y * 10.0f)));
+            hash = MixDiag(hash, static_cast<uint64_t>(static_cast<int64_t>(r.loc.Z * 10.0f)));
+        }
+        hash = MixText(hash, r.name);
+        hash = MixText(hash, r.cls);
+        hash = MixText(hash, r.key);
+        sackRows.push_back(std::move(r));
+    }
+
+    if (!g_sackDiagFirst && hash == g_lastSackDiagHash) return;
+    g_sackDiagFirst = false;
+    g_lastSackDiagHash = hash;
+    UE_LOGI("[drone_sack_diag] %s -- drones=%zu prop_dronesack_actors=%zu (component rows follow)",
+            isHost ? "HOST" : "CLIENT", droneRows.size(), sackRows.size());
+    for (const auto& d : droneRows) {
+        UE_LOGI("[drone_sack_diag] DRONE actor=%p name='%ls' hasSack=%d canTakeOff=%d container=%p components=%zu",
+                d.actor, d.name.c_str(), d.hasSack ? 1 : 0, d.canTakeOff ? 1 : 0,
+                d.container, d.components.size());
+        for (const auto& c : d.components) {
+            const bool visible = (c.visByte & (1u << 4)) != 0;
+            const bool hidden = (c.hiddenByte & (1u << 2)) != 0;
+            UE_LOGI("[drone_sack_diag] DRONE-COMP owner=%p comp=%p name='%ls' class='%ls' parentComp=%p parentActor=%p mesh=%p('%ls') childActor=%p('%ls'/%ls) visible=%d hidden=%d",
+                    d.actor, c.object, c.name.c_str(), c.cls.c_str(), c.attachParent,
+                    c.parentOwner, c.meshAsset, c.meshName.c_str(), c.childActor,
+                    c.childActorName.c_str(), c.childActorClass.c_str(), visible ? 1 : 0, hidden ? 1 : 0);
+        }
+    }
+    for (const auto& r : sackRows) {
+        const bool rootVisible = (r.rootVisByte & (1u << 4)) != 0;
+        const bool rootHidden = (r.rootHiddenByte & (1u << 2)) != 0;
+        const std::wstring parentName = (r.parent && R::IsLive(r.parent))
+            ? R::ToString(R::NameOf(r.parent)) : L"<null>";
+        const std::wstring parentClass = (r.parent && R::IsLive(r.parent))
+            ? R::ClassNameOf(r.parent) : L"<null>";
+        const std::wstring rootOwnerName = (r.rootParentOwner && R::IsLive(r.rootParentOwner))
+            ? R::ToString(R::NameOf(r.rootParentOwner)) : L"<null>";
+        UE_LOGI("[drone_sack_diag] SACK actor=%p name='%ls' class='%ls' key='%ls' eid=%u mirrorEid=%u container=%p taken=%d "
+                "parentRead=%d parent=%p('%ls'/%ls) root=%p rootParentComp=%p rootParentOwner=%p('%ls') "
+                "visible=%d hidden=%d collision=%d simulating=%d heldByLocal=%d locRead=%d loc=(%.1f,%.1f,%.1f)",
+                r.actor, r.name.c_str(), r.cls.c_str(), r.key.c_str(), r.eid, r.mirrorEid, r.container,
+                r.taken ? 1 : 0, r.parentRead ? 1 : 0, r.parent, parentName.c_str(), parentClass.c_str(),
+                r.root, r.rootAttachParent, r.rootParentOwner, rootOwnerName.c_str(),
+                rootVisible ? 1 : 0, rootHidden ? 1 : 0, r.rootCollision, r.simulating ? 1 : 0,
+                r.heldByLocal ? 1 : 0, r.locRead ? 1 : 0, r.loc.X, r.loc.Y, r.loc.Z);
+    }
+}
+
 uint64_t HashRows(const std::vector<Row>& rows) {
     uint64_t h = 1469598103934665603ull;
     auto mix = [&h](uint64_t v) { h ^= v; h *= 1099511628211ull; };
@@ -172,6 +418,7 @@ void Tick(bool isHost) {
         UE_LOGI("[delivery_census] SACK actor=%p taken=%d container=%p", s,
                 (offT >= 0) ? (ReadAt<uint8_t>(s, offT) ? 1 : 0) : -1, sc);
     }
+    EmitDroneSackDiagnostic(isHost, drones, sacks);
 
     // Q-A: COUNT the containers by CLASS. Not a key lookup -- the key lookup is the broken thing.
     std::vector<Row> rows;
