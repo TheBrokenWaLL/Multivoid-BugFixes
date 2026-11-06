@@ -179,6 +179,7 @@ struct SackSearch {
     void* container = nullptr;
     void* best = nullptr;
     bool bestAttached = false;
+    bool bestContainerMatch = false;
     float bestDistanceSq = 1.0e30f;
 };
 
@@ -187,13 +188,16 @@ void FindSackCandidate(void* raw, void* sack, int32_t) {
     if (!sack || !R::IsLive(sack)) return;
     const auto* bytes = reinterpret_cast<const uint8_t*>(sack);
     void* const container = *reinterpret_cast<void* const*>(bytes + g_sackContainerOff);
-    if (container != search.container) return;
+    const bool containerMatch = search.container && container == search.container;
 
+    // The actor relationship is a stronger identity signal than a possibly stale Blueprint
+    // container pointer. This is important during the drop transition: the old mounted sack must
+    // still be found so the host can publish it and the client can retire/adopt its local copy.
     const bool taken = *reinterpret_cast<const bool*>(bytes + g_sackTakenOff);
     void* parent = nullptr;
     const bool parentRead = E::GetAttachParentActor(sack, parent);
-    const bool physicallyAttached = parentRead && parent == search.drone;
-    const bool attached = physicallyAttached || (taken && !parentRead);
+    const bool attached = parentRead ? parent == search.drone : taken;
+    if (!containerMatch && !attached) return;
 
     FVector loc{};
     float distanceSq = 0.f;
@@ -204,10 +208,13 @@ void FindSackCandidate(void* raw, void* sack, int32_t) {
             distanceSq = dx * dx + dy * dy + dz * dz;
         }
     }
-    if (!search.best || (attached && !search.bestAttached) ||
-        (attached == search.bestAttached && distanceSq < search.bestDistanceSq)) {
+    // Prefer attached actors, then actors already bound to the shared inventory, then proximity.
+    const int rank = (attached ? 2 : 0) + (containerMatch ? 1 : 0);
+    const int bestRank = (search.bestAttached ? 2 : 0) + (search.bestContainerMatch ? 1 : 0);
+    if (!search.best || rank > bestRank || (rank == bestRank && distanceSq < search.bestDistanceSq)) {
         search.best = sack;
         search.bestAttached = attached;
+        search.bestContainerMatch = containerMatch;
         search.bestDistanceSq = distanceSq;
     }
 }
@@ -288,13 +295,24 @@ void RestoreTick(void* drone) {
 
 void* FindSack(void* drone) {
     if (!drone || !R::IsLive(drone) || !EnsureSackFieldsResolved()) return nullptr;
-    void* const container = ContainerOf(drone);
-    if (!container) return nullptr;
     SackSearch search;
     search.drone = drone;
-    search.container = container;
+    search.container = ContainerOf(drone);
     object_index::ForEachInstance(g_sackClass, &FindSackCandidate, &search);
     return search.best;
+}
+
+bool SetSackContainer(void* drone, void* sack) {
+    if (!drone || !sack || !R::IsLive(drone) || !R::IsLive(sack) ||
+        !EnsureGateFieldsResolved() || !EnsureSackFieldsResolved()) return false;
+    void* const container = ContainerOf(drone);
+    if (!container || !R::IsLive(container)) return false;
+    void** const slot = reinterpret_cast<void**>(reinterpret_cast<char*>(sack) + g_sackContainerOff);
+    if (*slot == container) return true;
+    void* const previous = *slot;
+    *slot = container;
+    UE_LOGI("drone: rebound sack container @0x%04X %p -> %p", g_sackContainerOff, previous, container);
+    return true;
 }
 
 bool IsSackAttached(void* drone, void* sack) {
@@ -306,34 +324,45 @@ bool IsSackAttached(void* drone, void* sack) {
     return taken;  // preserve the BP flag if this UE build does not expose GetAttachParentActor
 }
 
-bool ApplySackMirror(void* drone, bool present, bool attached, bool simulatePhysics, bool poseValid,
-                     const FVector& loc, const FRotator& rot) {
+bool ApplySackMirror(void* drone, void* sack, bool present, bool attached, bool simulatePhysics,
+                     bool poseValid, const FVector& loc, const FRotator& rot) {
     if (!drone || !R::IsLive(drone)) return false;
-    void* const sack = FindSack(drone);
-    if (!sack) return !present;  // an absent sack needs no actor-side work; a present one may spawn later
+    if (!present) return true;
+    if (!sack || !R::IsLive(sack) || !EnsureSackFieldsResolved()) return false;
+    // The sack actor itself is the opener used by the game's actionOptionIndex -> openPropInv
+    // path. The drone's container field alone is not enough: repair both sides of that relation.
+    if (!SetSackContainer(drone, sack)) return false;
 
-    if (poseValid) {
-        E::SetActorLocation(sack, loc);
-        E::SetActorRotation(sack, rot);
-    }
     if (attached) {
-        void* const root = E::RootComponentOf(drone);
-        if (!root) return false;
+        // Recreate the attachment when this peer is missing it; merely setting takenByDrone
+        // leaves the actor on the floor while the host reports it mounted. The host pose in this
+        // state edge corrects the world transform once, then the actor follows the drone root.
         void* parent = nullptr;
         const bool parentRead = E::GetAttachParentActor(sack, parent);
-        // Preserve the host's physics mode: some sack transitions have a short simulated phase
-        // even while the actor is attached. KeepWorld prevents a snap to the drone's origin.
         if (!parentRead || parent != drone) {
+            void* const root = E::RootComponentOf(drone);
+            if (!root) return false;
             E::SetActorSimulatePhysics(sack, false);
             if (!E::AttachActorToComponentKeepWorld(sack, root)) return false;
+        }
+        if (poseValid) {
+            E::SetActorLocation(sack, loc);
+            E::SetActorRotation(sack, rot);
         }
         E::SetActorSimulatePhysics(sack, simulatePhysics);
         return WriteSackTaken(sack, true);
     }
 
+    // Detach whenever the actor is still parented (or the parent query is unavailable). A
+    // readable null parent already means it is loose and must not be detached again.
     void* parent = nullptr;
-    if (E::GetAttachParentActor(sack, parent) && parent == drone) {
+    const bool parentRead = E::GetAttachParentActor(sack, parent);
+    if (!parentRead || parent) {
         if (!E::DetachActorFromParent(sack)) return false;
+    }
+    if (poseValid) {
+        E::SetActorLocation(sack, loc);
+        E::SetActorRotation(sack, rot);
     }
     E::SetActorSimulatePhysics(sack, simulatePhysics);
     return WriteSackTaken(sack, false);
@@ -354,9 +383,9 @@ uint8_t ReadFxBits(void* drone) {
         // must not turn a normal drone operation into a false "no sack" state.
         if (readBool(g_hasSackOff)) bits |= kFxHasSack;
     }
-    // When the actor is positively found detached, its physical state is authoritative for the
-    // interaction gate and can safely clear a stale Blueprint flag. If actor lookup fails, retain
-    // the game-owned hasSack value above instead of mutating the drone into an unusable state.
+    // When the actor is positively found detached, its physical state can clear a stale Blueprint
+    // hasSack flag. If actor lookup fails, retain the game-owned value above instead of mutating the
+    // drone into an unusable state.
     if (void* sack = FindSack(drone)) {
         bits |= kFxSackPresent;
         if (IsSackAttached(drone, sack)) bits |= kFxSackAttached | kFxHasSack;

@@ -363,17 +363,22 @@ door-verb, keypad and container lanes wait. The leave-timer face rides the same 
 its own drone's setting, which every peer's copy takes from the drone's state stream, and the console's
 click plays on the presser's machine and on the host. Removing the parked drone's sack uses the same
 intent lane: the client cancels its local `drone_C::dropSack`, and the host resolves its own drone,
-checks the sender's reach plus `canTakeOff`/`hasSack`, then runs the Blueprint verb once. The resulting
-sack actor's own transform and physical attachment are mirrored in `DroneState`: the client detaches
-its stale drone-mounted copy on a host drop, follows the host sack pose while it is loose, and attaches
-it to the local drone again when the host rehangs it. The host also derives the drone's `hasSack`
-interaction gate from the sack actor's actual attachment, rather than trusting a Blueprint flag that
-can remain stale after a drop. The drone and the sack must also name the same inventory actor. The drone's cooked `BeginPlay`
+checks the sender's reach plus `canTakeOff`/`hasSack`, then runs the Blueprint verb once. The sack
+actor's own identity and state are mirrored in `DroneState`. The client resolves the actor by its
+host element id, with its stable prop key as a fallback; the shared inventory-container pointer is not
+used as actor identity because more than one local sack actor can temporarily reference it during a
+drop transition. When a host-created sack arrives, the client adopts it or retires the stale mounted
+copy, rather than leaving two visible actors. The sack's own `container` field is rebound to the same
+inventory actor as the drone so `openPropInv` continues to work after an actor is adopted or recreated.
+The host derives the drone's `hasSack` interaction gate from the sack actor's actual attachment when
+that actor is positively found, while preserving the Blueprint value if the actor is not yet resolvable.
+The drone and the sack must also name the same inventory actor. The drone's cooked `BeginPlay`
 looks up `droneContainer`, which misses the world container keyed `drone_InventoryContainer` and
 can leave `drone.container` pointing at a private inventory; `compileOrder` writes through that
 field, while the sack opens the keyed world container. `drone_sync` now resolves the exact keyed
-actor and binds the drone's field to it on both host and client, retrying after world load or actor
-respawn. This keeps item additions, daily-task delivery and sale on the same `GObjStack` slot.
+actor and binds both the drone's and the sack's opener fields to it on host and client, retrying after
+world load or actor respawn. This keeps item additions, daily-task delivery and sale on the same
+`GObjStack` slot.
 
 ### The computer and the economy
 

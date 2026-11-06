@@ -78,20 +78,27 @@ inline constexpr uint8_t kFxSackSimulating = 0x80; // host sack root currently s
 bool ReadLeaveAfter5min(void* drone, bool& out);
 bool WriteLeaveAfter5min(void* drone, bool value);
 
-// Find the drone's sack actor by the shared drone_InventoryContainer pointer. Returns null until
-// the container and prop_dronesack_C actor are available. Game thread.
+// Find the drone's sack actor. Prefer an actor physically attached to the drone even when its
+// Blueprint container pointer is stale; otherwise match the shared drone_InventoryContainer.
+// Game thread.
 void* FindSack(void* drone);
+
+// Rebind a sack's opener field to the exact inventory actor used by the drone. This repairs the
+// BeginPlay/key lookup on an already-existing or adopted sack so openPropInv remains usable.
+// Game thread.
+bool SetSackContainer(void* drone, void* sack);
 
 // Read the sack's attachment state. The actor's takenByDrone flag is cross-checked against its
 // actual attach parent when that query is available, so a stale flag cannot leave a phantom drone
 // interaction enabled. Game thread.
 bool IsSackAttached(void* drone, void* sack);
 
-// CLIENT mirror: converge the local sack actor to the host's world pose, then attach/detach it
-// from the drone and toggle root physics. Returns false when a present sack has not spawned yet;
-// the caller should retry on a later tick. Game thread.
-bool ApplySackMirror(void* drone, bool present, bool attached, bool simulatePhysics, bool poseValid,
-                     const FVector& loc, const FRotator& rot);
+// CLIENT mirror: apply the host's state to the EXACT sack actor resolved by the host element id/key.
+// The caller must not pass an actor found only by the shared inventory-container pointer, since
+// multiple local/remote sack actors can reference that same container during a drop transition.
+// Returns false when a present actor is not available yet; retry on a later tick. Game thread.
+bool ApplySackMirror(void* drone, void* sack, bool present, bool attached, bool simulatePhysics,
+                     bool poseValid, const FVector& loc, const FRotator& rot);
 
 // HOST: read the synced drone state into the packed stateBits byte:
 // FX, arrival gate, leaveAfter5min and sack actor state. A sack that exists but is not physically

@@ -358,25 +358,37 @@ void OnSpawn(const coop::net::PropSpawnPayload& payload, int senderSlot,
         existing = coop::prop_key_index::Find(keyW);
     }
 
-    // The sack that starts mounted on the delivery drone can have a different local Key from the
-    // actor the host creates when dropping it. A key-only miss would then spawn a second sack on the
-    // client and leave the old one attached and non-interactive. Reuse the already-loaded mounted
-    // actor for this exact class, then run the normal position-adoption path (including wire rekey).
-    if (!existing && senderSlot == 0 && !fromConvert && !eidOnly && classW == L"prop_dronesack_C") {
+    // The save-loaded sack can coexist with the host-created dropped sack. Resolve the host's
+    // exact-key actor first; if it is distinct from the still-mounted local sack, retire that stale
+    // local actor so it cannot remain as a visible, non-interactive copy on the drone. When there
+    // is no exact-key actor, reuse the mounted actor through the normal position-adoption path.
+    // Do this for exact-key hits too: the old implementation only handled a key miss, which left
+    // the mounted copy behind whenever the host's dropped actor already resolved by key.
+    if (senderSlot == 0 && !fromConvert && !eidOnly && classW == L"prop_dronesack_C") {
         if (void* drone = ue_wrap::drone::Find()) {
             if (void* sackContainer = coop::prop_key_index::Find(L"drone_InventoryContainer"))
                 ue_wrap::drone::SetContainer(drone, sackContainer);
             if (void* mountedSack = ue_wrap::drone::FindSack(drone)) {
                 if (ue_wrap::drone::IsSackAttached(drone, mountedSack)) {
-                    UE_LOGI("remote_prop::OnSpawn: adopting the pre-existing drone-mounted sack %p for host spawn (wire key '%ls')",
-                            mountedSack, keyW.c_str());
-                    // Detach the old mounted copy before convergence; AdoptByPosition supplies the
-                    // host's exact world pose, rekeys the actor and binds it to the incoming eid.
-                    ue_wrap::drone::ApplySackMirror(drone, true, false, false, false,
-                                                   ue_wrap::FVector{}, ue_wrap::FRotator{});
-                    AdoptByPosition(payload, senderSlot, mountedSack, localPlayer);
-                    if (outSpawned) *outSpawned = mountedSack;
-                    return;
+                    if (existing && existing != mountedSack) {
+                        // The canonical host actor must remain a working container opener even if
+                        // its BeginPlay key lookup ran before the shared container was indexed.
+                        ue_wrap::drone::SetSackContainer(drone, existing);
+                        UE_LOGI("remote_prop::OnSpawn: retiring stale mounted sack %p; host sack %p already resolves (wire key '%ls')",
+                                mountedSack, existing, keyW.c_str());
+                        coop::remote_prop::ClearAnyDriveFor(mountedSack);
+                        coop::remote_prop::ConsumeLocalActor(mountedSack);
+                    } else if (!existing) {
+                        UE_LOGI("remote_prop::OnSpawn: adopting mounted sack %p for host spawn (wire key '%ls')",
+                                mountedSack, keyW.c_str());
+                        // Detach before convergence and bind the reused actor to the authoritative
+                        // drone inventory, preserving the sack's openPropInv interaction path.
+                        ue_wrap::drone::ApplySackMirror(drone, mountedSack, true, false, false, false,
+                                                       ue_wrap::FVector{}, ue_wrap::FRotator{});
+                        AdoptByPosition(payload, senderSlot, mountedSack, localPlayer);
+                        if (outSpawned) *outSpawned = mountedSack;
+                        return;
+                    }
                 }
             }
         }

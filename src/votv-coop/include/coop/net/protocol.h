@@ -30,7 +30,7 @@ inline constexpr uint32_t kMagic = 0x564D5450u;
 // This file is past the 1500-line hard cap and stays there: it is the single-feature exception the
 // rule names. One wire format, whose enum, payload structs and static_asserts are read together;
 // splitting it would put a kind's number in one file and its bytes in another.
-inline constexpr uint16_t kProtocolVersion = 266;
+inline constexpr uint16_t kProtocolVersion = 267;
 
 // Default LAN port (overridable via multivoid.ini "net.port=").
 inline constexpr uint16_t kDefaultPort = 47621;
@@ -2930,10 +2930,12 @@ struct DroneStatePayload {
     uint8_t adopt;             // 1  -- 1 = host connect-snapshot (snap as is), 0 = live stream
     uint8_t _pad;              // 1
     float   dustX, dustY, dustZ;  // 12 -- the dust emitter's world location, valid while bit 0 is set
+    uint32_t sackEid;           // 4  -- host element identity of the sack; 0 when not tracked/present
+    WireKey sackKey;            // 32 -- stable prop key fallback; empty when the sack has no key
     float   sackX, sackY, sackZ; // 12 -- sack actor world location, valid while the sack-pose bit is set
     float   sackPitch, sackYaw, sackRoll; // 12 -- sack actor world rotation, valid while sack-pose is set
 };
-static_assert(sizeof(DroneStatePayload) == 64, "DroneStatePayload must be 64 bytes");
+static_assert(sizeof(DroneStatePayload) == 100, "DroneStatePayload must be 100 bytes");
 
 // A shop order (OrderRequest), client to host: this header, then chunkItems packed items, each
 //     uint8  head;        // low 7 bits: the name's length (1..kMaxOrderRowName); top bit: the kind,
