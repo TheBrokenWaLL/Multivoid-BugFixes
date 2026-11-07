@@ -397,7 +397,12 @@ the drone ends in a destroy of the loose prop, and the game's own post-destroy g
 game's own re-mount (`drone_C::putSackOn`) writes `takenByDrone` in the same breath as its destroy, and
 no multiplayer path of that re-mount runs that Blueprint step on the peer that destroys -- the host's
 container put-in and the wire-applied mirror each destroy their own copy -- so the marker is mirrored
-in at the destroy seam's entry, whichever graph called it. The single-player recovery that loop feeds
+in at the destroy seam's entry, whichever graph called it. The same seam completes the re-mount's
+visual half: the game's `dropSack` hides the drone's own sack mesh with SetVisibility and its
+`putSackOn` is the only step that shows it again, so a multiplayer put-back would leave the host's
+mesh hidden (its own game never ran its putSackOn) and the acting client's waiting a packet on the
+host's word -- the seam shows it on whichever peer's graph called the destroy, the console click's
+precedent, with the host's word confirming a packet later. The single-player recovery that loop feeds
 -- the guard's respawn landing on the drone's socket and running `putSackOn` -- never runs in
 multiplayer, so the host authors the put-back's completion itself: a loose sack prop that disappears
 beside a parked drone is a sack put back, the host sets its own sack-aboard flag, and the flag's own

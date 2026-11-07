@@ -77,7 +77,23 @@ ue_wrap::script_gate::Verdict OnK2DestroyPre(void* context, void* /*srcObj*/, co
     // put-in, or the wire-applied mirror on this receiver -- and neither runs the Blueprint step
     // on the peer that destroys, so the marker goes in before the engine takes the actor: one
     // site, whichever graph called the destroy.
-    if (ue_wrap::drone::IsSackProp(context)) ue_wrap::drone::SetSackTaken(context, true);
+    if (ue_wrap::drone::IsSackProp(context)) {
+        ue_wrap::drone::SetSackTaken(context, true);
+        // The re-mount's visual half, completed here for the same reason. The game's dropSack
+        // hides the drone's own sack mesh with SetVisibility and its putSackOn is the only step
+        // that shows it again, so a multiplayer put-back leaves the host's mesh hidden (the
+        // host's own game never ran its putSackOn) and the acting client's waiting on the host's
+        // word. The marker above has already said this destroy is the re-mount, so the mesh
+        // follows it on whichever peer's graph called the destroy -- instant local feedback, the
+        // console click's precedent, with the host's word confirming the state a packet later.
+        if (void* drone = ue_wrap::drone::Find()) {
+            // Said once per drone instance: a new session or level re-arms it.
+            static std::atomic<void*> s_sackRemountDrone{nullptr};
+            if (ue_wrap::drone::SetSackVisual(drone, true) && !s_sackRemountDrone.exchange(drone)) {
+                UE_LOGI("drone: the drone's own sack visual is shown -- a sack was put back here");
+            }
+        }
+    }
     HandViewDestroy* freeSlot = nullptr;
     for (HandViewDestroy& r : g_handViewDestroy) {
         if (r.actor == context) {
