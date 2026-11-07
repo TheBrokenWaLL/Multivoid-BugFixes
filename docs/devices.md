@@ -397,8 +397,13 @@ the drone ends in a destroy of the loose prop, and the game's own post-destroy g
 game's own re-mount (`drone_C::putSackOn`) writes `takenByDrone` in the same breath as its destroy, and
 no multiplayer path of that re-mount runs that Blueprint step on the peer that destroys -- the host's
 container put-in and the wire-applied mirror each destroy their own copy -- so the marker is mirrored
-in at the destroy seam's entry, whichever graph called it. The swing itself is the authority's local
-physics, like the drone's flight, and shows on the peer whose player put the sack back. The drone and the
+in at the destroy seam's entry, whichever graph called it. The single-player recovery that loop feeds
+-- the guard's respawn landing on the drone's socket and running `putSackOn` -- never runs in
+multiplayer, so the host authors the put-back's completion itself: a loose sack prop that disappears
+beside a parked drone is a sack put back, the host sets its own sack-aboard flag, and the flag's own
+readers (the host's Blueprint, the client's gate fields and `SetSackVisual`) take the state from the
+host's word. The swing itself is the authority's local physics, like the drone's flight, and shows on
+the peer whose player put the sack back. The drone and the
 sack must also name the same inventory actor. The drone's cooked `BeginPlay`
 looks up `droneContainer`, which misses the world container keyed `drone_InventoryContainer` and
 can leave `drone.container` pointing at a private inventory; `compileOrder` writes through that

@@ -42,6 +42,19 @@ constexpr uint64_t kContainerBindRetryMs = 1000; // retry after the world/key in
 // covers a construction script that lands after the host's first word; past them the visual is
 // somebody else's problem (the census names the components).
 constexpr int kSackVisualMaxTries = 40;
+
+// The put-back's completion, host-authored. In single player a sack put back on the drone ends in
+// the loose prop's destroy, which trips the game's own post-destroy guard: its respawn lands on the
+// drone's socket and runs putSackOn, and THAT is what sets the drone's hasSack and shows the drone's
+// own sack mesh. In multiplayer every destroy of the sack is clean -- the destroy seam mirrors the
+// re-mount marker so the guard stays quiet on every peer, with no toast and no per-peer phantom --
+// so that loop never runs and a host drone that had its sack put back would carry no sack at all,
+// and the sack would vanish from every screen. The host therefore authors the completion itself: a
+// loose sack prop that disappears while the drone is parked IS a sack put back, the host's own word
+// then carries it to every peer, and the flag's own tick-driven readers (the host's Blueprint, the
+// client's gate fields and SetSackVisual) take it from there.
+bool     g_hostSackWasPresent = false;  // the host's last read had a loose sack prop
+bool     g_putBackLogged = false;       // the completion, said once a put-back
 // Past its flight and its dust, how far the drone must be from the pose last sent for a new one to
 // go: a glide streams until it is this close to where it rests, and a parked drone sends nothing.
 constexpr float    kMoveEpsCm  = 1.0f;
@@ -489,9 +502,23 @@ void Tick() {
         g_nextCheckMs = nowMs + kSendIntervalMs;
         HostRead r;
         if (!ReadHost(drone, r)) return;
+        // The put-back's completion: the loose sack prop is gone while the drone is parked, which
+        // is a sack put back (the only way a sack prop dies beside a parked drone). The host sets
+        // its own sack-aboard flag, as the game's own recovery would have, and the word carries it.
+        bool putBack = false;
+        if (!r.sackPresent && g_hostSackWasPresent && (r.bits & D::kFxArrived) != 0) {
+            putBack = true;
+            if (!g_putBackLogged) {
+                g_putBackLogged = true;
+                UE_LOGI("drone: the sack was put back on the drone -- the host carries the sack aboard");
+            }
+        }
+        g_hostSackWasPresent = r.sackPresent;
+        if (r.sackPresent) g_putBackLogged = false;  // re-armed for the next put-back
         // The Blueprint can leave hasSack set after its sack actor has been detached. Keep the
         // host's interaction options in lockstep with the actual physical attachment too.
-        D::WriteGateFields(drone, (r.bits & D::kFxArrived) != 0, (r.bits & D::kFxHasSack) != 0);
+        D::WriteGateFields(drone, (r.bits & D::kFxArrived) != 0,
+                           (r.bits & D::kFxHasSack) != 0 || putBack);
         const float dx = r.loc.X - g_sentLoc.X, dy = r.loc.Y - g_sentLoc.Y, dz = r.loc.Z - g_sentLoc.Z;
         const bool moved =
             !g_haveSent || dx * dx + dy * dy + dz * dz > kMoveEpsCm * kMoveEpsCm ||
@@ -579,6 +606,8 @@ void OnDisconnect() {
     g_sentSackRot = FRotator{};
     g_sentSackEid = 0;
     g_sentSackKey = coop::net::WireKey{};
+    g_hostSackWasPresent = false;
+    g_putBackLogged = false;
     g_installLogged = false;
 }
 
