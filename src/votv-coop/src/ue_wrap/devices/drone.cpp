@@ -529,6 +529,39 @@ void SetSignalLight(void* drone, bool on) {
     }
 }
 
+bool SetSackVisual(void* drone, bool on) {
+    if (!drone || !R::IsLive(drone)) return false;
+    int matched = 0;
+    for (const auto& child : R::ChildObjectsOf(drone)) {
+        if (!child.object || !R::IsLive(child.object)) continue;
+        std::wstring lowered = child.name;
+        for (auto& ch : lowered)
+            if (ch >= L'A' && ch <= L'Z') ch = static_cast<wchar_t>(ch - L'A' + L'a');
+        // A child actor of the sack prop renders through its own actor, not through the component:
+        // hiding the component alone leaves it on screen, so the actor is hidden too.
+        void* childActor = nullptr;
+        if (child.className.find(L"ChildActorComponent") != std::wstring::npos) {
+            const int32_t off = R::FindPropertyOffset(R::ClassOf(child.object), L"ChildActor");
+            if (off >= 0) {
+                childActor = *reinterpret_cast<void* const*>(
+                    reinterpret_cast<const char*>(child.object) + off);
+                if (childActor && !R::IsLive(childActor)) childActor = nullptr;
+                if (childActor) {
+                    std::wstring childClass = R::ClassNameOf(childActor);
+                    for (auto& ch : childClass)
+                        if (ch >= L'A' && ch <= L'Z') ch = static_cast<wchar_t>(ch - L'A' + L'a');
+                    if (childClass.find(L"sack") == std::wstring::npos) childActor = nullptr;
+                }
+            }
+        }
+        if (lowered.find(L"sack") == std::wstring::npos && !childActor) continue;
+        ++matched;
+        E::SetComponentVisible(child.object, on, /*propagate=*/true);
+        if (childActor) E::SetActorHiddenInGame(childActor, !on);
+    }
+    return matched > 0;
+}
+
 bool CanDropSack(void* drone) {
     if (!drone || !EnsureGateFieldsResolved()) return false;
     const char* const bytes = reinterpret_cast<const char*>(drone);

@@ -380,7 +380,17 @@ confirmed drone parent. The client honours an explicit host `sackPresent=false` 
 retires stale mounted copies once the host actor is known, and defers transform/attachment writes
 while the local player owns the sack.
 Detached mirrors restore actor-level and root query collision so the normal E-to-pick-up path remains
-available. The drone and the sack must also name the same inventory actor. The drone's cooked `BeginPlay`
+available. The sack the drone carries while it is parked is not that actor: it is the drone Blueprint's
+own component apparatus (`sack`, `sackPhys`, `sackHitbox`, `sackConstraint`, `sackInteract` over the
+dronesack mesh), which `dropSack` itself hides in the same breath as it spawns the ground prop. A client
+cancels that body, so the cancelled graph's own half never ran on its copy and the apparatus stayed up
+under the drone after every drop -- a visible duplicate with no actor behind it. The word that means a
+sack is aboard is `hasSack` (the mounted state has no prop actor at all), and it is the bit the action
+options are gated on, so the client takes the visual from it (`ue_wrap::drone::SetSackVisual`): the
+apparatus's components are shown while the host reports a sack aboard and hidden once it is off the
+drone, edge-triggered with a spaced retry for a construction script that lands after the host's first
+word, and a sack child actor is hidden through its actor, since hiding the component does not hide the
+actor it carries. The drone and the sack must also name the same inventory actor. The drone's cooked `BeginPlay`
 looks up `droneContainer`, which misses the world container keyed `drone_InventoryContainer` and
 can leave `drone.container` pointing at a private inventory; `compileOrder` writes through that
 field, while the sack opens the keyed world container. `drone_sync` now resolves the exact keyed

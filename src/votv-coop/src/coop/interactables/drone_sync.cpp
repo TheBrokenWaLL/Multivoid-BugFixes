@@ -38,6 +38,10 @@ using ue_wrap::FRotator;
 
 constexpr uint64_t kSendIntervalMs = 50;   // ~20 Hz at most, while the drone moves or its state changes
 constexpr uint64_t kContainerBindRetryMs = 1000; // retry after the world/key index loads or the actor respawns
+// The drone's own sack apparatus resolves with the drone actor, so a handful of spaced attempts
+// covers a construction script that lands after the host's first word; past them the visual is
+// somebody else's problem (the census names the components).
+constexpr int kSackVisualMaxTries = 40;
 // Past its flight and its dust, how far the drone must be from the pose last sent for a new one to
 // go: a glide streams until it is this close to where it rests, and a parked drone sends nothing.
 constexpr float    kMoveEpsCm  = 1.0f;
@@ -70,6 +74,15 @@ struct DroneMirror {
     uint64_t nextSackSyncMs = 0;
     uint32_t sackEid = 0;
     coop::net::WireKey sackKey{};
+    // The drone's own sack visual (its BP's sack* components), mirrored from the host's hasSack
+    // word: -1 before the host's first word settles it, 0/1 the state last written. A client cancels
+    // its dropSack body, so nothing local hides the apparatus after a host drop without this.
+    int8_t  sackVisualOn = -1;
+    bool    sackVisualPending = false;  // the apparatus has not resolved yet -- retry
+    bool    sackVisualLogged = false;   // the first transition, said once a session
+    bool    sackAboard = false;         // the host's hasSack word: a sack is aboard the drone
+    int     sackVisualTries = 0;        // spent attempts while the apparatus does not resolve
+    uint64_t nextSackVisualMs = 0;
     // The newest word that arrived before this peer's drone resolved, waiting whole -- the pose and the
     // gate fields with it -- for the first tick that finds the drone.
     bool    hasPending = false;
@@ -335,6 +348,7 @@ void ApplyState(void* drone, const coop::net::DroneStatePayload& payload) {
     // arrives after its DroneState; never choose a sack solely because it shares the inventory.
     g_m.sackPresent = (nb & D::kFxSackPresent) != 0;
     g_m.sackAttached = (nb & D::kFxSackAttached) != 0;
+    g_m.sackAboard = hasSack;
     g_m.sackPoseValid = (nb & D::kFxSackPose) != 0;
     g_m.sackSimulating = (nb & D::kFxSackSimulating) != 0;
     g_m.sackEid = payload.sackEid;
@@ -353,6 +367,27 @@ void ApplyState(void* drone, const coop::net::DroneStatePayload& payload) {
                                                   g_m.sackPoseValid, g_m.sackLoc, g_m.sackRot);
     }
     g_m.nextSackSyncMs = NowMs() + 250;
+
+    // The drone's own sack visual: the client cancelled the Blueprint body that would have hidden
+    // it, so the apparatus under the drone stays up after a host drop. The word that means "a sack
+    // is aboard" is hasSack -- the mounted sack is this apparatus, not the prop actor, so the
+    // attachment bit says nothing about the parked state -- and it is the same bit the action
+    // options are gated on, so the visual and the offered verbs never disagree. Retry while the
+    // drone's construction script has not instantiated the apparatus yet.
+    if (g_m.sackVisualOn != (g_m.sackAboard ? 1 : 0)) {
+        g_m.sackVisualPending = !D::SetSackVisual(drone, g_m.sackAboard);
+        if (!g_m.sackVisualPending) {
+            g_m.sackVisualOn = g_m.sackAboard ? 1 : 0;
+            if (!g_m.sackVisualLogged) {
+                g_m.sackVisualLogged = true;
+                UE_LOGI("drone: the drone's own sack visual is %s -- the host reports a sack %s",
+                        g_m.sackAboard ? "shown" : "hidden",
+                        g_m.sackAboard ? "aboard the drone" : "off the drone");
+            }
+        }
+    }
+        }
+    }
 
     // Interaction gate: write canTakeOff (THE gate) + hasSack (option prerequisite) onto the mirror so
     // a parked drone is interactable instead of "in motion" (the suppressed tick never sets them).
@@ -502,6 +537,25 @@ void Tick() {
                                                           g_m.sackPoseValid, g_m.sackLoc, g_m.sackRot);
             }
             g_m.nextSackSyncMs = NowMs() + 250;
+        }
+        if (g_m.sackVisualPending && NowMs() >= g_m.nextSackVisualMs) {
+            // The apparatus itself may resolve after the host's word (the construction script's
+            // components land with the actor's BeginPlay, which a streaming joiner can beat).
+            if (g_m.sackVisualOn != (g_m.sackAboard ? 1 : 0))
+                g_m.sackVisualPending = !D::SetSackVisual(drone, g_m.sackAboard);
+            else
+                g_m.sackVisualPending = false;
+            if (!g_m.sackVisualPending) {
+                g_m.sackVisualOn = g_m.sackAttached ? 1 : 0;
+                g_m.sackVisualTries = 0;
+            } else if (++g_m.sackVisualTries >= kSackVisualMaxTries) {
+                g_m.sackVisualPending = false;   // spend no more ticks on a drone with no apparatus
+                g_m.sackVisualTries = 0;
+                UE_LOGW("drone: the drone's own sack visual did not resolve in %d attempts -- the "
+                        "duplicate under the drone stays; the census names its components",
+                        kSackVisualMaxTries);
+            }
+            g_m.nextSackVisualMs = NowMs() + 250;
         }
         if (g_m.hasPose) { AdvanceInterp(g_m); ApplyMirror(drone, g_m); }
     }
