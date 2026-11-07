@@ -386,8 +386,6 @@ void ApplyState(void* drone, const coop::net::DroneStatePayload& payload) {
             }
         }
     }
-        }
-    }
 
     // Interaction gate: write canTakeOff (THE gate) + hasSack (option prerequisite) onto the mirror so
     // a parked drone is interactable instead of "in motion" (the suppressed tick never sets them).
