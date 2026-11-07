@@ -157,6 +157,7 @@ inline constexpr RefFn kRefFns[] = {
     {L"drone_c", L"compileorder", L"drone_c.compileorder", 0x6a2d5d90ab51fa2dull, 0xfee1d44eca12a841ull},
     {L"drone_c", L"dropsack", L"drone_c.dropsack", 0x6a2d5d90ab51fa2dull, 0x90f38b2cbea49151ull},
     {L"drone_c", L"player_use", L"drone_c.player_use", 0xe87a23146f2bd561ull, 0x88e1e15908426517ull},
+    {L"drone_c", L"putsackon", L"drone_c.putsackon", 0x0a8a91583cff8fb7ull, 0xdc152eff90adf1ffull},
     {L"drone_c", L"receivebeginplay", L"drone_c.receivebeginplay", 0x6a2d5d90ab51fa2dull, 0xf6c5a9eaaa046811ull},
     {L"drone_c", L"receivetick", L"drone_c.receivetick", 0x6082ffdfa2cda429ull, 0x8b2bbf91dcb38891ull},
     {L"drone_c", L"sendshop", L"drone_c.sendshop", 0x86e97b977440a166ull, 0x1b87ffdd76e3e039ull},

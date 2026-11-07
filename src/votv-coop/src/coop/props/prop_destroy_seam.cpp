@@ -25,6 +25,7 @@
 #include "coop/props/prop_element_tracker.h"
 #include "coop/session/world_load_episode.h"
 #include "ue_wrap/engine/engine.h"  // IsChildActor
+#include "ue_wrap/devices/drone.h"  // IsSackProp/SetSackTaken -- the re-mount marker at a sack's destroy
 #include "ue_wrap/core/game_thread.h"
 #include "ue_wrap/core/log.h"
 #include "ue_wrap/actors/prop.h"
@@ -69,6 +70,14 @@ HandView NoteHandViewPost(void* actor) {
 ue_wrap::script_gate::Verdict OnK2DestroyPre(void* context, void* /*srcObj*/, const uint8_t* /*parms*/) {
     using ue_wrap::script_gate::Verdict;
     if (!context) return Verdict::Run;
+    // The drone sack's re-mount transition, mirrored at the destroy's entry: the game's own
+    // putSackOn sets takenByDrone before it destroys the loose prop, and its post-destroy guard
+    // (prop_dronesack_C::receiveDestroyed) scolds and respawns a sack that dies still reading
+    // loose. Every multiplayer destroy of the sack is that re-mount -- the host's container
+    // put-in, or the wire-applied mirror on this receiver -- and neither runs the Blueprint step
+    // on the peer that destroys, so the marker goes in before the engine takes the actor: one
+    // site, whichever graph called the destroy.
+    if (ue_wrap::drone::IsSackProp(context)) ue_wrap::drone::SetSackTaken(context, true);
     HandViewDestroy* freeSlot = nullptr;
     for (HandViewDestroy& r : g_handViewDestroy) {
         if (r.actor == context) {

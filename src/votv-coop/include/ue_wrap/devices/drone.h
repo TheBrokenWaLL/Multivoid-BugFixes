@@ -125,6 +125,18 @@ void PlayArrivalCue(void* drone);
 // CLIENT mirror: show/hide the arrival signal light (light_alarm). On while parked-with-cargo. GT.
 void SetSignalLight(void* drone, bool on);
 
+// The loose drone-sack prop actor (prop_dronesack_C), or false for anything else. Game thread.
+bool IsSackProp(void* actor);
+
+// The sack's `takenByDrone` marker: true while it is mounted on the drone. The game's own re-mount
+// (drone_C::putSackOn) sets it before the destroy that ends the loose prop, which is what keeps
+// the game's post-destroy guard (prop_dronesack_C::receiveDestroyed) quiet -- a sack destroyed
+// still reading loose earns the "stop destroying the drone sack" hint and a respawn at the drone.
+// Every multiplayer destroy of the sack is that same re-mount (the container put-in's own graph on
+// the host, or the wire-applied mirror on the receiver), and neither runs that Blueprint step on
+// the peer that destroys, so the marker is mirrored in at the destroy's entry. Game thread.
+bool SetSackTaken(void* sack, bool taken);
+
 // ---- the drone's own sack visual ------------------------------------------------------------------
 // The sack the drone carries while parked is not the prop actor: it is the drone BP's own
 // component apparatus (`sack` over the dronesack mesh, with `sackPhys`, `sackHitbox` and
@@ -134,7 +146,7 @@ void SetSignalLight(void* drone, bool on);
 // hasSack (the mounted state has no prop actor at all), so this takes the visual from that word
 // instead, as the dust and signal light take theirs.
 
-// Show or hide the drone's own sack visual: the mesh component whose asset is the dronesack mesh.
+// The drone's own sack visual: the mesh component whose asset is the dronesack mesh.
 // Only that one -- the sphere, the overlap box and the constraint around it are machinery the
 // Blueprint keeps hidden in every authored state, and toggling them leaves a sphere swinging
 // under the drone. False while no such component resolves (the construction script may not have

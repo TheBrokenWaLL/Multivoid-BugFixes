@@ -236,13 +236,20 @@ void FindSackCandidate(void* raw, void* sack, int32_t) {
     }
 }
 
-bool WriteSackTaken(void* sack, bool taken) {
+}  // namespace
+
+bool IsSackProp(void* actor) {
+    if (!actor || !R::IsLive(actor)) return false;
+    return EnsureSackFieldsResolved() && R::ClassOf(actor) == g_sackClass;
+}
+
+bool SetSackTaken(void* sack, bool taken) {
     if (!sack || !R::IsLive(sack) || !EnsureSackFieldsResolved()) return false;
+    // The game's own re-mount writes this in the same breath as its destroy, and its post-destroy
+    // guard reads it to tell a re-mount (mounted, quiet) from a dupe (loose, scolded and respawned).
     *reinterpret_cast<bool*>(reinterpret_cast<char*>(sack) + g_sackTakenOff) = taken;
     return true;
 }
-
-}  // namespace
 
 bool EnsureResolved() {
     if (g_resolved.load(std::memory_order_acquire)) return true;
@@ -401,7 +408,7 @@ bool ApplySackMirror(void* drone, void* sack, bool present, bool attached, bool 
         E::SetActorEnableCollision(sack, true);
         E::SetActorRootCollisionEnabled(sack, 3); // QueryAndPhysics
         E::SetActorSimulatePhysics(sack, simulatePhysics);
-        return WriteSackTaken(sack, true);
+        return SetSackTaken(sack, true);
     }
 
     // A detached mirror must remain grabbable with E. Only detach from this drone; never steal a
@@ -413,7 +420,7 @@ bool ApplySackMirror(void* drone, void* sack, bool present, bool attached, bool 
         reinterpret_cast<const char*>(sack) + g_sackTakenOff);
     if (parentRead && parent == drone && !E::DetachActorFromParent(sack)) return false;
     if (!parentRead && taken && !E::DetachActorFromParent(sack)) return false;
-    if (parentRead && parent && parent != drone) return WriteSackTaken(sack, false);
+    if (parentRead && parent && parent != drone) return SetSackTaken(sack, false);
     if (poseValid) {
         E::SetActorLocation(sack, loc);
         E::SetActorRotation(sack, rot);
@@ -421,7 +428,7 @@ bool ApplySackMirror(void* drone, void* sack, bool present, bool attached, bool 
     E::SetActorEnableCollision(sack, true);
     E::SetActorRootCollisionEnabled(sack, 3); // QueryAndPhysics
     E::SetActorSimulatePhysics(sack, simulatePhysics);
-    return WriteSackTaken(sack, false);
+    return SetSackTaken(sack, false);
 }
 
 uint8_t ReadFxBits(void* drone) {
@@ -604,7 +611,7 @@ void NormalizeDroppedSack(void* drone) {
         else if (parentRead && parent == nullptr) released = true;
         if (!released && (!parentRead || parent == drone))
             UE_LOGW("drone: dropSack post-hook could not detach sack %p", sack);
-        WriteSackTaken(sack, false);
+        SetSackTaken(sack, false);
         E::SetActorEnableCollision(sack, true);
         E::SetActorRootCollisionEnabled(sack, 3); // QueryAndPhysics
         if (released) E::SetActorSimulatePhysics(sack, true);

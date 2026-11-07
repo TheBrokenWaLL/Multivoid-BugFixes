@@ -391,7 +391,14 @@ is the bit the action options are gated on, so the client takes the visual from 
 the host reports a sack aboard and hidden once it is off the drone, edge-triggered with a spaced retry
 for a construction script that lands after the host's first word. Only that component is mirrored --
 the sphere, the overlap box and the constraint around it are machinery the Blueprint keeps hidden in
-every authored state, and toggling them leaves a sphere swinging under the drone. The drone and the
+every authored state, and toggling them leaves a sphere swinging under the drone. A sack put back on
+the drone ends in a destroy of the loose prop, and the game's own post-destroy guard
+(`prop_dronesack_C::receiveDestroyed`) scolds and respawns a sack that dies still reading loose: the
+game's own re-mount (`drone_C::putSackOn`) writes `takenByDrone` in the same breath as its destroy, and
+no multiplayer path of that re-mount runs that Blueprint step on the peer that destroys -- the host's
+container put-in and the wire-applied mirror each destroy their own copy -- so the marker is mirrored
+in at the destroy seam's entry, whichever graph called it. The swing itself is the authority's local
+physics, like the drone's flight, and shows on the peer whose player put the sack back. The drone and the
 sack must also name the same inventory actor. The drone's cooked `BeginPlay`
 looks up `droneContainer`, which misses the world container keyed `drone_InventoryContainer` and
 can leave `drone.container` pointing at a private inventory; `compileOrder` writes through that
