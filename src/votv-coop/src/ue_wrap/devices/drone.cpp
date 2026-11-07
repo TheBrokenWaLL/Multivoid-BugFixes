@@ -531,35 +531,47 @@ void SetSignalLight(void* drone, bool on) {
 
 bool SetSackVisual(void* drone, bool on) {
     if (!drone || !R::IsLive(drone)) return false;
-    int matched = 0;
+    // The apparatus around the drone's own sack: the mesh component `sack` (SkeletalMeshComponent
+    // over /Game/meshes/dronesack) is the visual, and it is the only one this mirrors. `sackPhys`
+    // (the drone's root sphere), `sackHitbox` (the loose-sack overlap) and `sackConstraint` (the
+    // re-mount physics) are machinery the Blueprint itself keeps hidden in every authored state --
+    // hiding or showing them leaves a sphere swinging under the drone or an invisible overlap
+    // behind. The MESH ASSET is the identity, not the component name: a Blueprint variable rename
+    // cannot spoof it, and it is what the delivery census reads to name the visual.
+    static int32_t sSkeletalMeshOff = -2;   // -2 = not resolved yet, -1 = absent (never matches)
+    static int32_t sStaticMeshOff = -2;
+    if (sSkeletalMeshOff == -2) {
+        sSkeletalMeshOff = -1;
+        if (void* cls = R::FindClass(L"SkeletalMeshComponent"))
+            sSkeletalMeshOff = R::FindPropertyOffset(cls, L"SkeletalMesh");
+    }
+    if (sStaticMeshOff == -2) {
+        sStaticMeshOff = -1;
+        if (void* cls = R::FindClass(L"StaticMeshComponent"))
+            sStaticMeshOff = R::FindPropertyOffset(cls, L"StaticMesh");
+    }
+    void* const skeletalBase = R::FindClass(L"SkeletalMeshComponent");
+    void* const staticBase = R::FindClass(L"StaticMeshComponent");
+    void* const bases[] = { skeletalBase, staticBase };
+    if (sSkeletalMeshOff < 0 && sStaticMeshOff < 0) return false;
     for (const auto& child : R::ChildObjectsOf(drone)) {
         if (!child.object || !R::IsLive(child.object)) continue;
-        std::wstring lowered = child.name;
-        for (auto& ch : lowered)
+        void* const cls = R::ClassOf(child.object);
+        if (!R::IsDescendantOfAny(cls, bases, 2)) continue;
+        const bool isSkeletal = skeletalBase && R::IsDescendantOfAny(cls, &skeletalBase, 1);
+        const int32_t off = isSkeletal ? sSkeletalMeshOff : sStaticMeshOff;
+        if (off < 0) continue;
+        void* const mesh = *reinterpret_cast<void* const*>(
+            reinterpret_cast<const char*>(child.object) + off);
+        if (!mesh || !R::IsLive(mesh)) continue;
+        std::wstring meshName = R::ToString(R::NameOf(mesh));
+        for (auto& ch : meshName)
             if (ch >= L'A' && ch <= L'Z') ch = static_cast<wchar_t>(ch - L'A' + L'a');
-        // A child actor of the sack prop renders through its own actor, not through the component:
-        // hiding the component alone leaves it on screen, so the actor is hidden too.
-        void* childActor = nullptr;
-        if (child.className.find(L"ChildActorComponent") != std::wstring::npos) {
-            const int32_t off = R::FindPropertyOffset(R::ClassOf(child.object), L"ChildActor");
-            if (off >= 0) {
-                childActor = *reinterpret_cast<void* const*>(
-                    reinterpret_cast<const char*>(child.object) + off);
-                if (childActor && !R::IsLive(childActor)) childActor = nullptr;
-                if (childActor) {
-                    std::wstring childClass = R::ClassNameOf(childActor);
-                    for (auto& ch : childClass)
-                        if (ch >= L'A' && ch <= L'Z') ch = static_cast<wchar_t>(ch - L'A' + L'a');
-                    if (childClass.find(L"sack") == std::wstring::npos) childActor = nullptr;
-                }
-            }
-        }
-        if (lowered.find(L"sack") == std::wstring::npos && !childActor) continue;
-        ++matched;
+        if (meshName.find(L"dronesack") == std::wstring::npos) continue;
         E::SetComponentVisible(child.object, on, /*propagate=*/true);
-        if (childActor) E::SetActorHiddenInGame(childActor, !on);
+        return true;
     }
-    return matched > 0;
+    return false;
 }
 
 bool CanDropSack(void* drone) {

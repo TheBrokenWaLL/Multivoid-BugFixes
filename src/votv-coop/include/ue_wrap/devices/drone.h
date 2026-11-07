@@ -126,18 +126,19 @@ void PlayArrivalCue(void* drone);
 void SetSignalLight(void* drone, bool on);
 
 // ---- the drone's own sack visual ------------------------------------------------------------------
-// The sack the drone carries while parked is not the prop actor: it is the drone BP's own apparatus
-// (sack / sackPhys / sackHitbox / sackConstraint / sackInteract over the dronesack mesh), which
-// dropSack hides in the same breath as it spawns the ground prop. A client cancels that body, so its
-// copy keeps the apparatus up after every drop -- a visible duplicate with no actor behind it. The
-// host's word that means "a sack is aboard" is hasSack (the mounted state has no actor at all), so
-// this takes the visual from that word instead, as the dust and signal light take theirs.
+// The sack the drone carries while parked is not the prop actor: it is the drone BP's own
+// component apparatus (`sack` over the dronesack mesh, with `sackPhys`, `sackHitbox` and
+// `sackConstraint` around it), which `dropSack` hides in the same breath as it spawns the ground
+// prop. A client cancels that body, so its copy keeps the apparatus up after every drop -- a
+// visible duplicate with no actor behind it. The host's word that means "a sack is aboard" is
+// hasSack (the mounted state has no prop actor at all), so this takes the visual from that word
+// instead, as the dust and signal light take theirs.
 
-// Hide/show the drone's own sack apparatus: every SceneComponent the drone owns whose name carries
-// "sack", plus a drone-owned sack child actor (a ChildActorComponent's own actor is not hidden by
-// hiding the component, so the actor itself is hidden as well). False while nothing matches -- the
-// drone's construction script may not have instantiated the apparatus yet, and the caller retries.
-// Game thread.
+// Show or hide the drone's own sack visual: the mesh component whose asset is the dronesack mesh.
+// Only that one -- the sphere, the overlap box and the constraint around it are machinery the
+// Blueprint keeps hidden in every authored state, and toggling them leaves a sphere swinging
+// under the drone. False while no such component resolves (the construction script may not have
+// instantiated it yet), and the caller retries. Game thread.
 bool SetSackVisual(void* drone, bool on);
 
 // CLIENT mirror: write the interaction-gate fields (canTakeOff, hasSack) onto the
