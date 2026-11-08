@@ -16,6 +16,10 @@ namespace ue_wrap::engine {
 // DetachActorFromParent reverses it. Game thread.
 bool AttachActorToComponentSocket(void* actor, void* component, const wchar_t* socket);
 
+// Attach `actor` to `component` while preserving its current world transform. Useful when a
+// replicated actor must begin following a parent without snapping to the parent's origin. Game thread.
+bool AttachActorToComponentKeepWorld(void* actor, void* component);
+
 bool DetachActorFromParent(void* actor);
 
 // AActor::GetAttachParentActor: the actor `actor`'s root is attached to, or null in `parent` when it is attached to

@@ -8,6 +8,7 @@
 #include "ue_wrap/core/log.h"
 #include "ue_wrap/core/cached_obj_ref.h"
 #include "ue_wrap/core/reflection.h"
+#include "ue_wrap/core/reflection_props.h"  // EnumerateStructFields -- a verb's parameters
 #include "ue_wrap/facts/function_row.h"
 
 #include <array>
@@ -35,6 +36,24 @@ std::array<WatchedFn, 32> g_watched{};
 size_t g_watchedCount = 0;
 std::atomic<bool> g_receiveTickLogged{false};
 
+// A verb's own parameters, read once per function: the re-mount lane needs to know whether
+// drone_C::putSackOn takes the sack actor, and the UFunction's ChildProperties carry the answer.
+void LogVerbParams(const char* label, void* function) {
+    static void* sLogged[std::size(g_watched)]{};
+    static size_t sLoggedCount = 0;
+    for (size_t i = 0; i < sLoggedCount; ++i) if (sLogged[i] == function) return;
+    if (sLoggedCount < std::size(sLogged)) sLogged[sLoggedCount++] = function;
+    std::wstring fields;
+    for (const auto& f : R::EnumerateStructFields(function)) {
+        fields += L" ";
+        fields += f.name;
+        fields += L"@";
+        fields += std::to_wstring(f.offset);
+    }
+    UE_LOGI("[drone_probe] PARAMS %s:%ls", label,
+            fields.empty() ? L" (none)" : fields.c_str());
+}
+
 void OnDroneVerb(void* self, void* function, void* /*params*/) {
     if (!ProbeEnabled()) return;
     for (size_t i = 0; i < g_watchedCount; ++i) {
@@ -52,6 +71,7 @@ void OnDroneVerb(void* self, void* function, void* /*params*/) {
         }
         UE_LOGI("[drone_probe] VERB FIRED: %s (self=%p cls='%ls') -- ProcessEvent-DISPATCHED = OBSERVABLE",
                 g_watched[i].name, self, cls.c_str());
+        LogVerbParams(g_watched[i].name, function);
         return;
     }
 }
@@ -60,6 +80,7 @@ UE_FACT_FN(kRowReceiveTickDrone, "dev.drone_probe", L"drone_C", L"ReceiveTick", 
 UE_FACT_FN(kRowTriggerFlyDrone, "dev.drone_probe", L"drone_C", L"triggerFly", Dispatch);
 UE_FACT_FN(kRowBeginFlyDrone, "dev.drone_probe", L"drone_C", L"beginFly", Dispatch);
 UE_FACT_FN(kRowDropSackDrone, "dev.drone_probe", L"drone_C", L"dropSack", Dispatch);
+UE_FACT_FN(kRowPutSackOnDrone, "dev.drone_probe", L"drone_C", L"putSackOn", Dispatch);
 UE_FACT_FN(kRowSoundAlarmDrone, "dev.drone_probe", L"drone_C", L"soundAlarm", Dispatch);
 UE_FACT_FN(kRowCheckOrdersDrone, "dev.drone_probe", L"drone_C", L"checkOrders", Dispatch);
 UE_FACT_FN(kRowCompileOrderDrone, "dev.drone_probe", L"drone_C", L"compileOrder", Dispatch);
@@ -246,6 +267,7 @@ void Install() {
     RegisterOn(kRowTriggerFlyDrone,      "drone.triggerFly",      false);
     RegisterOn(kRowBeginFlyDrone,        "drone.beginFly",        false);
     RegisterOn(kRowDropSackDrone,        "drone.dropSack",        false);
+    RegisterOn(kRowPutSackOnDrone,       "drone.putSackOn",       false);
     RegisterOn(kRowSoundAlarmDrone,      "drone.soundAlarm",      false);
     RegisterOn(kRowCheckOrdersDrone,     "drone.checkOrders",     false);
     RegisterOn(kRowCompileOrderDrone,    "drone.compileOrder",    false);

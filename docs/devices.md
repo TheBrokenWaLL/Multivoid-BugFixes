@@ -417,19 +417,34 @@ runs on the host only, which is what makes selling into it the one economy path 
 group correctly.
 
 The garage console calls and sends it. Its one action option dispatches on what the presser is
-looking at -- the keyboard runs the drone's own call-or-send verb, the other face toggles the
-drone's leave timer and clicks -- and the console holds its drone as a level reference, so every peer's
-console points at that peer's own drone. A client's press therefore reached a mirror whose flight
-tick is suppressed: nothing moved and nobody heard about it, which is why only the host could work
-the button. The client now refuses its own body at the script-body gate and sends the press. The
-console carries no identity to name, so the host takes the console of its own world that the sender
-stands at, re-tests its own copy of the lid, then runs the same verb, so the flight starts on the
-machine that owns it and arrives on the stream that already carries it
-(`coop/interactables/drone_call_intent`). A press that reaches the host before it holds the sender's
-body, from a joiner who presses at once, waits for the body rather than being refused, as the
-door-verb, keypad and container lanes wait. The leave-timer face rides the same lane: the host flips
-its own drone's setting, which every peer's copy takes from the drone's state stream, and the console's
-click plays on the presser's machine and on the host.
+looking at, and the console holds its drone as a level reference, so every peer's console points at
+that peer's own drone. A client's press reached a tick-suppressed mirror, so it is refused at the
+script-body gate and sent; the host takes the console of its own world that the sender stands at,
+re-tests its lid and runs the same verb, so the flight starts on the machine that owns it (`coop/interactables/drone_call_intent`). Removing the parked
+drone's sack uses the same lane: the client cancels its local `drone_C::dropSack`, and the host
+resolves its own drone, checks the sender's reach plus `canTakeOff`/`hasSack`, then runs the
+Blueprint verb once. The sack actor's identity and state ride `DroneState`: the client resolves it
+by host element id with the key as fallback -- never the shared inventory pointer -- adopting or
+retiring the copy it finds and deferring writes while the local player owns it. The host derives
+`hasSack` from the sack's actual attachment, a post hook reconciles the completed drop, and an
+explicit host `sackPresent=false` is authoritative. The sack the drone carries while parked is not
+that actor: it is the drone Blueprint's own apparatus (`sack` over the dronesack mesh, with
+`sackPhys`, `sackHitbox` and `sackConstraint` around it), which `dropSack` hides in the same breath
+as it spawns the ground prop. A client cancels that body, so its copy kept the apparatus up after
+every drop; `hasSack` (the mounted state has no prop actor, and it gates the action options) now
+drives `ue_wrap::drone::SetSackVisual`, which shows the mesh component whose asset is the dronesack
+mesh -- only that one, the sphere, box and constraint being machinery the Blueprint keeps hidden. A
+sack put back ends in a destroy of the loose prop, and the game's post-destroy guard
+(`prop_dronesack_C::receiveDestroyed`) scolds and respawns a sack that dies still reading loose: the
+game's own re-mount (`drone_C::putSackOn`) writes `takenByDrone` in the same breath as its destroy,
+and no multiplayer path runs that step on the peer that destroys, so the destroy seam mirrors the
+marker and completes the re-mount's visual half at the entry -- instant on the peer whose graph
+called the destroy. The host authors the put-back's completion (the single-player recovery never
+runs in multiplayer): a loose sack gone beside a parked drone is a sack put back, the host sets its
+own sack-aboard flag, and the flag's readers take it from the host's word; the swing is local
+physics. The drone and the sack name the same inventory actor: `drone_sync`
+binds both opener fields to the keyed `drone_InventoryContainer` on every peer (the drone's cooked
+lookup misses it), so delivery and sale keep one `GObjStack` slot.
 
 ### The woodchipper
 

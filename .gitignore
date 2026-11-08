@@ -6,6 +6,7 @@
 # Our own toolset. Untracked whole: it is the workflow that maintains this project, not
 # something a person forking it runs. What the CI genuinely needs lives in .github/ci.
 tools/
+patches/
 
 /Game_*/
 *.exe

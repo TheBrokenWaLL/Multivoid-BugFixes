@@ -9,6 +9,7 @@
 #include "ue_wrap/devices/drone.h"
 
 #include "ue_wrap/core/call.h"
+#include "ue_wrap/core/cached_obj_ref.h"
 #include "ue_wrap/engine/engine.h"
 #include "ue_wrap/core/fname_utils.h"
 #include "ue_wrap/core/log.h"
@@ -68,23 +69,32 @@ int32_t g_hasSackOff   = -1;   // Adrone_C::hasSack   @0x0501
 int32_t g_containerOff = -1;   // Adrone_C::container @0x04F8 (Aprop_inventoryContainer_drone_C*)
 constexpr int32_t kHasSackFallback   = 0x0501;
 constexpr int32_t kContainerFallback = 0x04F8;
+bool g_gateFieldsResolved = false;
+
+bool EnsureGateFieldsResolved() {
+    if (g_gateFieldsResolved) return true;
+    if (!EnsureResolved() || !g_cls) return false;
+    g_canTakeOffOff = R::FindPropertyOffset(g_cls, L"canTakeOff");
+    if (g_canTakeOffOff < 0) g_canTakeOffOff = kCanTakeOffFallback;
+    g_hasSackOff = R::FindPropertyOffset(g_cls, L"hasSack");
+    if (g_hasSackOff < 0) g_hasSackOff = kHasSackFallback;
+    g_containerOff = R::FindPropertyOffset(g_cls, L"container");
+    if (g_containerOff < 0) g_containerOff = kContainerFallback;
+    g_gateFieldsResolved = true;
+    return true;
+}
 
 bool EnsureFxResolved() {
     if (g_fxResolved) return true;
     if (g_fxTried || !EnsureResolved() || !g_cls) return false;
     g_fxTried = true;
-    g_canTakeOffOff = R::FindPropertyOffset(g_cls, L"canTakeOff");
-    if (g_canTakeOffOff < 0) g_canTakeOffOff = kCanTakeOffFallback;
+    if (!EnsureGateFieldsResolved()) return false;
     g_dustOff = R::FindPropertyOffset(g_cls, L"eff_droneDust");
     if (g_dustOff < 0) g_dustOff = kDustFallback;
     g_audioAlarmOff = R::FindPropertyOffset(g_cls, L"audio_alarm");
     if (g_audioAlarmOff < 0) g_audioAlarmOff = kAudioAlarmFallback;
     g_lightAlarmOff = R::FindPropertyOffset(g_cls, L"light_alarm");
     if (g_lightAlarmOff < 0) g_lightAlarmOff = kLightAlarmFallback;
-    g_hasSackOff = R::FindPropertyOffset(g_cls, L"hasSack");
-    if (g_hasSackOff < 0) g_hasSackOff = kHasSackFallback;
-    g_containerOff = R::FindPropertyOffset(g_cls, L"container");
-    if (g_containerOff < 0) g_containerOff = kContainerFallback;
     // SetActive/Activate and bIsActive are declared on UActorComponent (the components' base); resolve
     // them there and dispatch on the concrete component instance (ProcessEvent resolves the impl).
     if (void* acCls = R::FindClass(L"ActorComponent")) {
@@ -151,7 +161,95 @@ void ActivateComponent(void* comp) {
     Call(comp, f);
 }
 
+void* g_sackClass = nullptr;
+int32_t g_sackContainerOff = -1;
+int32_t g_sackTakenOff = -1;
+// The Blueprint may clear/rebind the sack container during dropSack. Keep a slot-validated
+// reference to the drone's current sack so the host can still publish its detached actor.
+CachedObjRef g_sackOwnerDrone;
+CachedObjRef g_sackActor;
+
+bool EnsureSackFieldsResolved() {
+    if (!g_sackClass) g_sackClass = object_index::ClassByName(L"prop_dronesack_C");
+    if (!g_sackClass) return false;
+    if (g_sackContainerOff < 0)
+        g_sackContainerOff = R::FindPropertyOffset(g_sackClass, L"container");
+    if (g_sackTakenOff < 0)
+        g_sackTakenOff = R::FindPropertyOffset(g_sackClass, L"takenByDrone");
+    return g_sackContainerOff >= 0 && g_sackTakenOff >= 0;
+}
+
+struct SackSearch {
+    void* drone = nullptr;
+    void* container = nullptr;
+    void* exclude = nullptr;
+    void* best = nullptr;
+    bool attachedOnly = false;
+    bool includeOrphanedMountFlags = false; // cleanup scans only; never the normal sack resolver
+    int bestAttachmentRank = 0; // 3=physical parent, 2=orphaned takenByDrone marker
+    bool bestContainerMatch = false;
+    float bestDistanceSq = 1.0e30f;
+};
+
+void FindSackCandidate(void* raw, void* sack, int32_t) {
+    auto& search = *static_cast<SackSearch*>(raw);
+    if (!sack || sack == search.exclude || !R::IsLive(sack)) return;
+    const auto* bytes = reinterpret_cast<const uint8_t*>(sack);
+    void* const container = *reinterpret_cast<void* const*>(bytes + g_sackContainerOff);
+    const bool containerMatch = search.container && container == search.container;
+
+    // The actor relationship is a stronger identity signal than a possibly stale Blueprint
+    // container pointer. This is important during the drop transition: the old mounted sack must
+    // still be found so the host can publish it and the client can retire/adopt its local copy.
+    const bool taken = *reinterpret_cast<const bool*>(bytes + g_sackTakenOff);
+    void* parent = nullptr;
+    const bool parentRead = E::GetAttachParentActor(sack, parent);
+    // GetAttachParentActor can successfully return nullptr for a sack that the Blueprint still
+    // marks as mounted (the sack may be held at the drone socket by takenByDrone rather than by an
+    // actor-parent edge). Keep that actor in the cleanup candidate set so the client can retire its
+    // save-loaded visual twin. Do NOT use this fallback for the gameplay attachment gate:
+    // IsSackAttached deliberately remains strict and trusts a readable physical parent.
+    const bool attached = parentRead ? parent == search.drone : taken;
+    const bool orphanedMountFlag = search.includeOrphanedMountFlags && parentRead && parent == nullptr && taken;
+    const bool attachedCandidate = attached || orphanedMountFlag;
+    if (search.attachedOnly ? !attachedCandidate : (!containerMatch && !attachedCandidate)) return;
+
+    FVector loc{};
+    float distanceSq = 0.f;
+    if (E::TryGetActorLocation(sack, loc)) {
+        FVector droneLoc{};
+        if (E::TryGetActorLocation(search.drone, droneLoc)) {
+            const float dx = loc.X - droneLoc.X, dy = loc.Y - droneLoc.Y, dz = loc.Z - droneLoc.Z;
+            distanceSq = dx * dx + dy * dy + dz * dz;
+        }
+    }
+    // Prefer physically attached actors, then orphaned mount markers (cleanup only), then actors
+    // already bound to the shared inventory, then proximity. The strict IsSackAttached query below
+    // is unchanged, so a stale marker can never enable the drone's drop/interaction option.
+    const int rank = (attached ? 3 : (orphanedMountFlag ? 2 : 0)) + (containerMatch ? 1 : 0);
+    const int bestRank = search.bestAttachmentRank + (search.bestContainerMatch ? 1 : 0);
+    if (!search.best || rank > bestRank || (rank == bestRank && distanceSq < search.bestDistanceSq)) {
+        search.best = sack;
+        search.bestAttachmentRank = attached ? 3 : (orphanedMountFlag ? 2 : 0);
+        search.bestContainerMatch = containerMatch;
+        search.bestDistanceSq = distanceSq;
+    }
+}
+
 }  // namespace
+
+bool IsSackProp(void* actor) {
+    if (!actor || !R::IsLive(actor)) return false;
+    return EnsureSackFieldsResolved() && R::ClassOf(actor) == g_sackClass;
+}
+
+bool SetSackTaken(void* sack, bool taken) {
+    if (!sack || !R::IsLive(sack) || !EnsureSackFieldsResolved()) return false;
+    // The game's own re-mount writes this in the same breath as its destroy, and its post-destroy
+    // guard reads it to tell a re-mount (mounted, quiet) from a dupe (loose, scolded and respawned).
+    *reinterpret_cast<bool*>(reinterpret_cast<char*>(sack) + g_sackTakenOff) = taken;
+    return true;
+}
 
 bool EnsureResolved() {
     if (g_resolved.load(std::memory_order_acquire)) return true;
@@ -219,19 +317,148 @@ void RestoreTick(void* drone) {
     E::SetActorTickEnabled(drone, true);
 }
 
+void* FindAttachedSack(void* drone, void* except) {
+    if (!drone || !R::IsLive(drone) || !EnsureSackFieldsResolved()) return nullptr;
+    SackSearch search;
+    search.drone = drone;
+    search.container = ContainerOf(drone);
+    search.exclude = except;
+    search.attachedOnly = true;
+    search.includeOrphanedMountFlags = true;
+    object_index::ForEachInstance(g_sackClass, &FindSackCandidate, &search);
+    return search.best;
+}
+
+void* FindSack(void* drone) {
+    if (!drone || !R::IsLive(drone) || !EnsureSackFieldsResolved()) return nullptr;
+    if (!g_sackOwnerDrone.Is(drone)) {
+        g_sackOwnerDrone.Set(drone);
+        g_sackActor.Reset();
+    }
+    // Prefer a sack physically mounted on this drone. This normal resolver deliberately excludes
+    // orphaned takenByDrone markers: those are discovered only by the cleanup scans below, so a
+    // stale local visual can never win over the authoritative dropped actor.
+    SackSearch mountedSearch;
+    mountedSearch.drone = drone;
+    mountedSearch.container = ContainerOf(drone);
+    mountedSearch.attachedOnly = true;
+    object_index::ForEachInstance(g_sackClass, &FindSackCandidate, &mountedSearch);
+    if (mountedSearch.best) {
+        if (!g_sackActor.Is(mountedSearch.best)) g_sackActor.Set(mountedSearch.best);
+        return mountedSearch.best;
+    }
+    if (void* cached = g_sackActor.Get()) return cached;
+
+    SackSearch search;
+    search.drone = drone;
+    search.container = ContainerOf(drone);
+    object_index::ForEachInstance(g_sackClass, &FindSackCandidate, &search);
+    if (search.best) g_sackActor.Set(search.best);
+    return search.best;
+}
+
+bool SetSackContainer(void* drone, void* sack) {
+    if (!drone || !sack || !R::IsLive(drone) || !R::IsLive(sack) ||
+        !EnsureGateFieldsResolved() || !EnsureSackFieldsResolved()) return false;
+    void* const container = ContainerOf(drone);
+    if (!container || !R::IsLive(container)) return false;
+    void** const slot = reinterpret_cast<void**>(reinterpret_cast<char*>(sack) + g_sackContainerOff);
+    if (*slot == container) return true;
+    void* const previous = *slot;
+    *slot = container;
+    UE_LOGI("drone: rebound sack container @0x%04X %p -> %p", g_sackContainerOff, previous, container);
+    return true;
+}
+
+bool IsSackAttached(void* drone, void* sack) {
+    if (!drone || !sack || !R::IsLive(drone) || !R::IsLive(sack) ||
+        !EnsureSackFieldsResolved()) return false;
+    const bool taken = *reinterpret_cast<const bool*>(reinterpret_cast<const char*>(sack) + g_sackTakenOff);
+    void* parent = nullptr;
+    if (E::GetAttachParentActor(sack, parent)) return parent == drone;
+    return taken;  // use the Blueprint flag only when the engine cannot read the parent edge
+}
+
+bool ApplySackMirror(void* drone, void* sack, bool present, bool attached, bool simulatePhysics,
+                     bool poseValid, const FVector& loc, const FRotator& rot) {
+    if (!drone || !R::IsLive(drone)) return false;
+    if (!present) return true;
+    if (!sack || !R::IsLive(sack) || !EnsureSackFieldsResolved()) return false;
+    // The sack actor itself is the opener used by the game's actionOptionIndex -> openPropInv
+    // path. The drone's container field alone is not enough: repair both sides of that relation.
+    if (!SetSackContainer(drone, sack)) return false;
+
+    if (attached) {
+        // Recreate the attachment when this peer is missing it; merely setting takenByDrone
+        // leaves the actor on the floor while the host reports it mounted. The host pose in this
+        // state edge corrects the world transform once, then the actor follows the drone root.
+        void* parent = nullptr;
+        const bool parentRead = E::GetAttachParentActor(sack, parent);
+        if (parentRead && parent && parent != drone) return false; // preserve a locally owned prop
+        if (!parentRead || parent != drone) {
+            void* const root = E::RootComponentOf(drone);
+            if (!root) return false;
+            E::SetActorSimulatePhysics(sack, false);
+            if (!E::AttachActorToComponentKeepWorld(sack, root)) return false;
+        }
+        if (poseValid) {
+            E::SetActorLocation(sack, loc);
+            E::SetActorRotation(sack, rot);
+        }
+        E::SetActorEnableCollision(sack, true);
+        E::SetActorRootCollisionEnabled(sack, 3); // QueryAndPhysics
+        E::SetActorSimulatePhysics(sack, simulatePhysics);
+        return SetSackTaken(sack, true);
+    }
+
+    // A detached mirror must remain grabbable with E. Only detach from this drone; never steal a
+    // sack currently parented to the local player/another owner. Restore actor + root query collision
+    // because the Blueprint drop graph is intentionally suppressed on clients.
+    void* parent = nullptr;
+    const bool parentRead = E::GetAttachParentActor(sack, parent);
+    const bool taken = *reinterpret_cast<const bool*>(
+        reinterpret_cast<const char*>(sack) + g_sackTakenOff);
+    if (parentRead && parent == drone && !E::DetachActorFromParent(sack)) return false;
+    if (!parentRead && taken && !E::DetachActorFromParent(sack)) return false;
+    if (parentRead && parent && parent != drone) return SetSackTaken(sack, false);
+    if (poseValid) {
+        E::SetActorLocation(sack, loc);
+        E::SetActorRotation(sack, rot);
+    }
+    E::SetActorEnableCollision(sack, true);
+    E::SetActorRootCollisionEnabled(sack, 3); // QueryAndPhysics
+    E::SetActorSimulatePhysics(sack, simulatePhysics);
+    return SetSackTaken(sack, false);
+}
+
 uint8_t ReadFxBits(void* drone) {
     if (!drone) return 0;
     uint8_t bits = 0;
     bool leaveAfter5min = false;
     if (ReadLeaveAfter5min(drone, leaveAfter5min) && leaveAfter5min) bits |= kFxLeaveAfter5min;
+    if (EnsureGateFieldsResolved()) {
+        const auto readBool = [drone](int32_t off) -> bool {
+            return off >= 0 && *reinterpret_cast<const bool*>(reinterpret_cast<const char*>(drone) + off);
+        };
+        if (readBool(g_canTakeOffOff)) bits |= kFxArrived;  // parked/arrived -> the interaction gate
+        // Keep the Blueprint's own hasSack flag as the fallback when its sack actor is not resolvable.
+        // triggerFly/compileOrder may also consult this game-owned flag; an incomplete actor search
+        // must not turn a normal drone operation into a false "no sack" state.
+        if (readBool(g_hasSackOff)) bits |= kFxHasSack;
+    }
+    // When the actor is positively found detached, its physical state can clear a stale Blueprint
+    // hasSack flag. If actor lookup fails, retain the game-owned value above instead of mutating the
+    // drone into an unusable state.
+    if (void* sack = FindSack(drone)) {
+        bits |= kFxSackPresent;
+        if (IsSackAttached(drone, sack)) bits |= kFxSackAttached | kFxHasSack;
+        else bits &= static_cast<uint8_t>(~kFxHasSack);
+        if (E::IsActorRootSimulatingPhysics(sack)) bits |= kFxSackSimulating;
+    }
+    // FX components are optional; their absence must not hide the interaction-gate state above.
     if (!EnsureFxResolved()) return bits;
     if (void* dust = ReadComp(drone, g_dustOff))
         if (ComponentIsActive(dust)) bits |= kFxDust;
-    auto rb = [drone](int32_t off) -> bool {
-        return off >= 0 && *reinterpret_cast<const bool*>(reinterpret_cast<const char*>(drone) + off);
-    };
-    if (rb(g_canTakeOffOff)) bits |= kFxArrived;   // parked/arrived -> the interaction gate
-    if (rb(g_hasSackOff))    bits |= kFxHasSack;   // cargo aboard -> the action-option prerequisite
     return bits;
 }
 
@@ -309,37 +536,129 @@ void SetSignalLight(void* drone, bool on) {
     }
 }
 
-void WriteGateFields(void* drone, bool canTakeOff, bool hasSack) {
-    if (!drone || !EnsureFxResolved()) return;
-    // The client's suppressed tick never sets these, so a parked mirror drone reads "in motion" +
-    // shows no action options. Mirror the host's values so a parked drone is interactable (RE: the
-    // actionOptionIndex gate is `IFNOT(canTakeOff) -> "drone is in motion"`; getActionOptions needs
-    // hasSack for the open-inv/drop options to appear).
-    if (g_canTakeOffOff >= 0)
-        *reinterpret_cast<bool*>(reinterpret_cast<char*>(drone) + g_canTakeOffOff) = canTakeOff;
-    if (g_hasSackOff >= 0)
-        *reinterpret_cast<bool*>(reinterpret_cast<char*>(drone) + g_hasSackOff) = hasSack;
+bool SetSackVisual(void* drone, bool on) {
+    if (!drone || !R::IsLive(drone)) return false;
+    // The apparatus around the drone's own sack: the mesh component `sack` (SkeletalMeshComponent
+    // over /Game/meshes/dronesack) is the visual, and it is the only one this mirrors. `sackPhys`
+    // (the drone's root sphere), `sackHitbox` (the loose-sack overlap) and `sackConstraint` (the
+    // re-mount physics) are machinery the Blueprint itself keeps hidden in every authored state --
+    // hiding or showing them leaves a sphere swinging under the drone or an invisible overlap
+    // behind. The MESH ASSET is the identity, not the component name: a Blueprint variable rename
+    // cannot spoof it, and it is what the delivery census reads to name the visual.
+    static int32_t sSkeletalMeshOff = -2;   // -2 = not resolved yet, -1 = absent (never matches)
+    static int32_t sStaticMeshOff = -2;
+    if (sSkeletalMeshOff == -2) {
+        sSkeletalMeshOff = -1;
+        if (void* cls = R::FindClass(L"SkeletalMeshComponent"))
+            sSkeletalMeshOff = R::FindPropertyOffset(cls, L"SkeletalMesh");
+    }
+    if (sStaticMeshOff == -2) {
+        sStaticMeshOff = -1;
+        if (void* cls = R::FindClass(L"StaticMeshComponent"))
+            sStaticMeshOff = R::FindPropertyOffset(cls, L"StaticMesh");
+    }
+    void* const skeletalBase = R::FindClass(L"SkeletalMeshComponent");
+    void* const staticBase = R::FindClass(L"StaticMeshComponent");
+    void* const bases[] = { skeletalBase, staticBase };
+    if (sSkeletalMeshOff < 0 && sStaticMeshOff < 0) return false;
+    for (const auto& child : R::ChildObjectsOf(drone)) {
+        if (!child.object || !R::IsLive(child.object)) continue;
+        void* const cls = R::ClassOf(child.object);
+        if (!R::IsDescendantOfAny(cls, bases, 2)) continue;
+        const bool isSkeletal = skeletalBase && R::IsDescendantOfAny(cls, &skeletalBase, 1);
+        const int32_t off = isSkeletal ? sSkeletalMeshOff : sStaticMeshOff;
+        if (off < 0) continue;
+        void* const mesh = *reinterpret_cast<void* const*>(
+            reinterpret_cast<const char*>(child.object) + off);
+        if (!mesh || !R::IsLive(mesh)) continue;
+        std::wstring meshName = R::ToString(R::NameOf(mesh));
+        for (auto& ch : meshName)
+            if (ch >= L'A' && ch <= L'Z') ch = static_cast<wchar_t>(ch - L'A' + L'a');
+        if (meshName.find(L"dronesack") == std::wstring::npos) continue;
+        E::SetComponentVisible(child.object, on, /*propagate=*/true);
+        return true;
+    }
+    return false;
 }
 
-void RepointContainer(void* drone) {
-    if (!drone || !EnsureFxResolved() || g_containerOff < 0) return;
-    // openPropInv(container) reads the mirror drone's OWN container@0x04F8, which the suppressed tick
-    // never populates. The container actor itself (Aprop_inventoryContainer_drone_C, keyed
-    // 'droneContainer') is already mirrored by the prop pipeline -- find it + point the field at it so
-    // the inventory opens. Idempotent: only writes when the field is null + the actor exists.
-    void** slot = reinterpret_cast<void**>(reinterpret_cast<char*>(drone) + g_containerOff);
-    if (*slot && R::IsLive(*slot)) return;  // already pointed at a live container
-    if (void* c = R::FindObjectByClass(L"prop_inventoryContainer_drone_C")) {
-        *slot = c;
-        UE_LOGI("drone: repointed mirror container @0x%04X -> %p (prop-mirrored 'droneContainer')",
-                g_containerOff, c);
+bool CanDropSack(void* drone) {
+    if (!drone || !EnsureGateFieldsResolved()) return false;
+    const char* const bytes = reinterpret_cast<const char*>(drone);
+    const bool parked = *reinterpret_cast<const bool*>(bytes + g_canTakeOffOff);
+    const bool blueprintHasSack = *reinterpret_cast<const bool*>(bytes + g_hasSackOff);
+    void* const sack = FindSack(drone);
+    // Let the authoritative Blueprint complete its own drop transition when its interaction gate
+    // says the sack is mounted, even if the actor-parent query is momentarily stale/unavailable.
+    return parked && (blueprintHasSack || (sack && IsSackAttached(drone, sack)));
+}
+
+void NormalizeDroppedSack(void* drone) {
+    if (!drone || !R::IsLive(drone) || !EnsureGateFieldsResolved() || !EnsureSackFieldsResolved()) return;
+    // A stale mount can coexist with the actor the Blueprint just dropped. Detach every remaining
+    // drone-owned sack, but never detach an actor with a different live parent (a player hold).
+    void* except = nullptr;
+    for (int i = 0; i < 8; ++i) {
+        void* const sack = FindAttachedSack(drone, except);
+        if (!sack) break;
+        except = sack;
+        void* parent = nullptr;
+        const bool parentRead = E::GetAttachParentActor(sack, parent);
+        const bool taken = *reinterpret_cast<const bool*>(
+            reinterpret_cast<const char*>(sack) + g_sackTakenOff);
+        bool released = false;
+        if (parentRead && parent == drone) released = E::DetachActorFromParent(sack);
+        else if (!parentRead && taken) released = E::DetachActorFromParent(sack);
+        else if (parentRead && parent == nullptr) released = true;
+        if (!released && (!parentRead || parent == drone))
+            UE_LOGW("drone: dropSack post-hook could not detach sack %p", sack);
+        SetSackTaken(sack, false);
+        E::SetActorEnableCollision(sack, true);
+        E::SetActorRootCollisionEnabled(sack, 3); // QueryAndPhysics
+        if (released) E::SetActorSimulatePhysics(sack, true);
+        UE_LOGI("drone: normalized dropped sack actor %p (released=%d)", sack, released ? 1 : 0);
     }
+    // The Blueprint can leave this gate true after the sack actor leaves the socket. The host is
+    // authoritative for the completed drop, so clear only this interaction prerequisite.
+    *reinterpret_cast<bool*>(reinterpret_cast<char*>(drone) + g_hasSackOff) = false;
+    // Do not let the pre-drop actor be reused as the authoritative post-drop sack if the Blueprint
+    // destroyed/replaced it or cleared its inventory binding. The normal prop lane/key census can
+    // discover the resulting world actor independently on the next host read.
+    g_sackActor.Reset();
+}
+
+bool DropSack(void* drone) {
+    if (!drone || !R::IsLive(drone)) return false;
+    void* const fn = R::FindDispatchFunctionCached(R::ClassOf(drone), L"dropSack");
+    if (!fn) return false;
+    ParamFrame frame(fn);
+    return frame.valid() && Call(drone, frame);
+}
+
+void WriteGateFields(void* drone, bool canTakeOff, bool hasSack) {
+    if (!drone || !EnsureGateFieldsResolved()) return;
+    // The client's suppressed tick never sets these, so a parked mirror drone reads "in motion" +
+    // shows no action options. Mirror the host's values so the same interaction options are exposed.
+    *reinterpret_cast<bool*>(reinterpret_cast<char*>(drone) + g_canTakeOffOff) = canTakeOff;
+    *reinterpret_cast<bool*>(reinterpret_cast<char*>(drone) + g_hasSackOff) = hasSack;
+}
+
+bool SetContainer(void* drone, void* container) {
+    if (!drone || !container || !R::IsLive(drone) || !R::IsLive(container) ||
+        !EnsureGateFieldsResolved()) return false;
+    void* const containerClass = R::FindClass(L"prop_inventoryContainer_drone_C");
+    void* const actualClass = R::ClassOf(container);
+    if (!containerClass || !actualClass || !R::IsDescendantOfAny(actualClass, &containerClass, 1)) return false;
+
+    void** const slot = reinterpret_cast<void**>(reinterpret_cast<char*>(drone) + g_containerOff);
+    if (*slot == container) return true;
+    void* const previous = *slot;
+    *slot = container;
+    UE_LOGI("drone: bound shared sack container @0x%04X %p -> %p", g_containerOff, previous, container);
+    return true;
 }
 
 void* ContainerOf(void* drone) {
-    if (!drone) return nullptr;
-    EnsureFxResolved();   // sets the offset (its FX members are not needed here)
-    if (g_containerOff < 0) return nullptr;
+    if (!drone || !EnsureGateFieldsResolved()) return nullptr;
     void* const c = *reinterpret_cast<void* const*>(reinterpret_cast<const char*>(drone) + g_containerOff);
     return c && R::IsLive(c) ? c : nullptr;
 }

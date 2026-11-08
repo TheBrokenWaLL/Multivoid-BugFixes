@@ -49,33 +49,61 @@ void SuppressTick(void* drone);
 void RestoreTick(void* drone);
 
 // ---- FX mirroring ----------------------------------------------------------------------------
-// The CLIENT suppresses the drone's ReceiveTick, which also kills the tick-driven FX: the
-// rotor-wash DUST (eff_droneDust) and the delivery "items ready" alarm cue (audio_alarm +
-// light_alarm). The drone's tick sphere-traces 2000uu down each tick and
-// (1) SetActive(hit, false) on an IsActive!=hit edge,
-// (2) K2_SetWorldLocation's eff_droneDust to the ground hit -- the component is bAbsoluteLocation
-// with NO relative offset, so unmoved it sits at WORLD ORIGIN (invisible: frustum-culled fixed
-// bounds), and (3) SetFloatParameter('dust', 1 - dist/2000) (a [0,1] RateScale). The PS is
-// EmitterLoops=1/20s -- it self-completes and needs the per-tick IsActive!=want re-arm. So the
-// HOST streams the FX bits + the dust component's world location in DroneState (about 20 Hz while
-// Active or the dust is on, and as they change) and the CLIENT replays the BP's exact three calls per packet (ApplyDustMirror). The
-// alarm cue fires on the canTakeOff false->true edge (drone within 25cm of its drop).
+// The CLIENT suppresses the drone's ReceiveTick, which also kills the tick-driven FX: the rotor-wash
+// DUST (eff_droneDust) and the "items ready" alarm cue (audio_alarm + light_alarm). The tick
+// sphere-traces 2000uu down each tick and (1) SetActive(hit, false) on an IsActive!=hit edge,
+// (2) K2_SetWorldLocation's eff_droneDust to the hit (the component is bAbsoluteLocation with no
+// relative offset, so unmoved it renders at WORLD ORIGIN, frustum-culled invisible), and (3)
+// SetFloatParameter('dust', 1 - dist/2000). The PS is EmitterLoops=1/20s, so it needs the per-tick
+// re-arm. The HOST streams the FX bits and the dust anchor in DroneState and the CLIENT replays the
+// same three calls per packet (ApplyDustMirror); the alarm cue fires on the canTakeOff rising edge.
 
 // stateBits packing (DroneStatePayload.stateBits): bit0 = dust active, bit1 = canTakeOff (arrived /
-// the interaction gate), bit2 = hasSack (cargo aboard / the action-option prerequisite), bit3 =
-// leaveAfter5min (the delivery drone's five-minute departure setting).
+// the interaction gate), bit2 = hasSack (a physically attached sack), bit3 = leaveAfter5min,
+// bit4 = sack actor present, bit5 = sack physically attached, bit6 = sack world pose valid,
+// bit7 = sack root simulates physics.
 inline constexpr uint8_t kFxDust     = 0x01;
 inline constexpr uint8_t kFxArrived  = 0x02;
 inline constexpr uint8_t kFxHasSack  = 0x04;
 inline constexpr uint8_t kFxLeaveAfter5min = 0x08;
+inline constexpr uint8_t kFxSackPresent = 0x10;  // the prop_dronesack_C actor exists on this peer
+inline constexpr uint8_t kFxSackAttached = 0x20; // the sack actor is physically attached to the drone
+inline constexpr uint8_t kFxSackPose = 0x40;     // the sack's world transform is valid in the packet
+inline constexpr uint8_t kFxSackSimulating = 0x80; // host sack root currently simulates physics
 
 // Drone's leave mode: true means leave after five minutes, false means wait indefinitely.
 bool ReadLeaveAfter5min(void* drone, bool& out);
 bool WriteLeaveAfter5min(void* drone, bool value);
 
+// Find the drone's sack actor. Prefer an actor physically attached to the drone even when its
+// Blueprint container pointer is stale; otherwise match the shared drone_InventoryContainer.
+// Game thread.
+void* FindSack(void* drone);
+
+// Find another sack physically mounted on this drone, or left with an orphaned takenByDrone marker
+// and no actor parent; the latter is a cleanup candidate only, not proof of gameplay attachment.
+// `except` can skip a previously returned actor so stale local copies can be retired one by one. GT.
+void* FindAttachedSack(void* drone, void* except = nullptr);
+
+// Rebind a sack's opener field to the exact inventory actor used by the drone. This repairs the
+// BeginPlay/key lookup on an already-existing or adopted sack so openPropInv remains usable.
+// Game thread.
+bool SetSackContainer(void* drone, void* sack);
+
+// Read the sack's attachment state. The physical attach parent wins whenever the engine can
+// read it, so a stale takenByDrone flag cannot leave a phantom drone interaction enabled. Game thread.
+bool IsSackAttached(void* drone, void* sack);
+
+// CLIENT mirror: apply the host's state to the EXACT sack actor resolved by the host element id/key.
+// The caller must not pass an actor found only by the shared inventory-container pointer, since
+// multiple local/remote sack actors can reference that same container during a drop transition.
+// Returns false when a present actor is not available yet; retry on a later tick. Game thread.
+bool ApplySackMirror(void* drone, void* sack, bool present, bool attached, bool simulatePhysics,
+                     bool poseValid, const FVector& loc, const FRotator& rot);
+
 // HOST: read the synced drone state into the packed stateBits byte:
-// eff_droneDust's bIsActive bit (what its IsActive returns), canTakeOff, hasSack and leaveAfter5min,
-// all from memory with no engine call. Game thread.
+// FX, arrival gate, leaveAfter5min and sack actor state. A sack that exists but is not physically
+// attached does not satisfy the interaction gate. Game thread.
 uint8_t ReadFxBits(void* drone);
 
 // HOST: read eff_droneDust's world location (the BP pins it to its ground-trace hit per tick) for
@@ -94,14 +122,53 @@ void PlayArrivalCue(void* drone);
 // CLIENT mirror: show/hide the arrival signal light (light_alarm). On while parked-with-cargo. GT.
 void SetSignalLight(void* drone, bool on);
 
+// The loose drone-sack prop actor (prop_dronesack_C), or false for anything else. Game thread.
+bool IsSackProp(void* actor);
+
+// The sack's `takenByDrone` marker: true while it is mounted on the drone. The game's own re-mount
+// (drone_C::putSackOn) sets it before the destroy that ends the loose prop, which is what keeps
+// the game's post-destroy guard (prop_dronesack_C::receiveDestroyed) quiet -- a sack destroyed
+// still reading loose earns the "stop destroying the drone sack" hint and a respawn at the drone.
+// Every multiplayer destroy of the sack is that same re-mount (the container put-in's own graph on
+// the host, or the wire-applied mirror on the receiver), and neither runs that Blueprint step on
+// the peer that destroys, so the marker is mirrored in at the destroy's entry. Game thread.
+bool SetSackTaken(void* sack, bool taken);
+
+// ---- the drone's own sack visual ------------------------------------------------------------------
+// The sack the drone carries while parked is not the prop actor: it is the drone BP's own
+// component apparatus (`sack` over the dronesack mesh, with `sackPhys`, `sackHitbox` and
+// `sackConstraint` around it), which `dropSack` hides in the same breath as it spawns the ground
+// prop. A client cancels that body, so its copy keeps the apparatus up after every drop -- a
+// visible duplicate with no actor behind it. The host's word that means "a sack is aboard" is
+// hasSack (the mounted state has no prop actor at all), so this takes the visual from that word
+// instead, as the dust and signal light take theirs.
+
+// The drone's own sack visual: the mesh component whose asset is the dronesack mesh.
+// Only that one -- the sphere, the overlap box and the constraint around it are machinery the
+// Blueprint keeps hidden in every authored state, and toggling them leaves a sphere swinging
+// under the drone. False while no such component resolves (the construction script may not have
+// instantiated it yet), and the caller retries. Game thread.
+bool SetSackVisual(void* drone, bool on);
+
 // CLIENT mirror: write the interaction-gate fields (canTakeOff, hasSack) onto the
 // mirror drone so a PARKED drone is interactable (else the gate prints "drone is in motion" + offers
 // no options -- the suppressed tick never sets them). Game thread.
 void WriteGateFields(void* drone, bool canTakeOff, bool hasSack);
 
-// CLIENT mirror: point the mirror drone's container field at the already-prop-mirrored cargo
-// container (Aprop_inventoryContainer_drone_C) so openPropInv opens it. Idempotent. Game thread.
-void RepointContainer(void* drone);
+// Whether the drone is parked with its sack physically attached. Does not trust a stale hasSack
+// Blueprint byte and does not depend on the optional FX components. Game thread.
+bool CanDropSack(void* drone);
+// HOST post-drop reconciliation: release any stale drone-owned sack actors, restore their query
+// collision and clear the Blueprint's stale hasSack interaction gate. Game thread.
+void NormalizeDroppedSack(void* drone);
+
+// Run the drone's own dropSack Blueprint verb. The multiplayer intent lane calls this on the host
+// after checking the sender's reach and the drone's state. Game thread.
+bool DropSack(void* drone);
+
+// Point the drone at the exact container also opened by its sack. False until the keyed actor is
+// available or when it is not a drone inventory container. Game thread.
+bool SetContainer(void* drone, void* container);
 
 // The container (Aprop_inventoryContainer_drone_C) the drone's `container` field names, or null when the field
 // is null or dead. Game thread.
