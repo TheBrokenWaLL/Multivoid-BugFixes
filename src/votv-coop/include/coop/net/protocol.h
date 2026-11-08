@@ -30,7 +30,7 @@ inline constexpr uint32_t kMagic = 0x564D5450u;
 // This file is past the 1500-line hard cap and stays there: it is the single-feature exception the
 // rule names. One wire format, whose enum, payload structs and static_asserts are read together;
 // splitting it would put a kind's number in one file and its bytes in another.
-inline constexpr uint16_t kProtocolVersion = 283;
+inline constexpr uint16_t kProtocolVersion = 284;
 
 // Default LAN port (overridable via multivoid.ini "net.port=").
 inline constexpr uint16_t kDefaultPort = 47621;
@@ -3318,13 +3318,16 @@ struct DroneStatePayload {
     float   x, y, z;           // 12 -- root actor world location (cm)
     float   pitch, yaw, roll;  // 12 -- full rotation (the drone leans/pitches in flight)
     uint8_t active;            // 1  -- Adrone_C::Active (dormant<->flying); a change is sent at once
-    uint8_t stateBits;         // 1  -- bit 0 rotor dust, bit 1 arrived, bit 2 has sack, bit 3 leaveAfter5min
+    uint8_t stateBits;         // 1  -- dust/arrival/hasSack/leaveAfter5min + sack presence/attachment/pose bits
     uint8_t adopt;             // 1  -- 1 = host connect-snapshot (snap as is), 0 = live stream
     uint8_t _pad;              // 1
-    float   dustX, dustY, dustZ;  // 12 -- the dust emitter's world location, which the host's tick pins to its ground
-                                  //        trace; the mirror replays the same calls. Valid while bit 0 is set.
+    float   dustX, dustY, dustZ;  // 12 -- the dust emitter's world location, valid while bit 0 is set
+    uint32_t sackEid;           // 4  -- host element identity of the sack; 0 when not tracked/present
+    WireKey sackKey;            // 32 -- stable prop key fallback; empty when the sack has no key
+    float   sackX, sackY, sackZ; // 12 -- sack actor world location, valid while the sack-pose bit is set
+    float   sackPitch, sackYaw, sackRoll; // 12 -- sack actor world rotation, valid while sack-pose is set
 };
-static_assert(sizeof(DroneStatePayload) == 40, "DroneStatePayload must be 40 bytes");
+static_assert(sizeof(DroneStatePayload) == 100, "DroneStatePayload must be 100 bytes");
 
 // A shop order (OrderRequest), client to host: this header, then chunkItems packed items, each
 //     uint8  head;        // low 7 bits: the name's length (1..kMaxOrderRowName); top bit: the kind,
@@ -3939,14 +3942,15 @@ struct GrabRefusedPayload {
 };
 static_assert(sizeof(GrabRefusedPayload) == 8, "GrabRefusedPayload must be 8 bytes");
 
-// A drone-call intent (DroneFlyIntent): the press itself, with which of the console's two faces it
-// was. Which face is the sender's reading of its own cursor, the only machine that has one, and the
-// console carries no identity to name (see the kind's comment), so the host resolves the console
-// the sender stands at and re-tests the lid there.
+// A drone intent (DroneFlyIntent): either a console-face press or a request to take the sack off
+// the parked drone. The console face is the sender's reading of its own cursor; the host resolves
+// the console the sender stands at. A sack-drop request instead resolves the singleton drone and
+// checks the sender's reach to it.
 namespace drone_verb {
 constexpr uint8_t kCall = 0;        // the keyboard's call/send
 constexpr uint8_t kLeaveTimer = 1;  // the leave timer face, a toggle on the host
-constexpr uint8_t kMax = kLeaveTimer;
+constexpr uint8_t kDropSack = 2;    // take the parked drone's sack off; executed only by the host
+constexpr uint8_t kMax = kDropSack;
 }  // namespace drone_verb
 struct DroneFlyIntentPayload {
     uint8_t verb;        // 1 -- drone_verb::k*

@@ -26,6 +26,7 @@
 #include "coop/props/prop_element_tracker.h"
 #include "coop/session/world_load_episode.h"
 #include "ue_wrap/engine/engine.h"  // IsChildActor
+#include "ue_wrap/devices/drone.h"  // IsSackProp/SetSackTaken -- the re-mount marker at a sack's destroy
 #include "ue_wrap/core/game_thread.h"
 #include "ue_wrap/core/log.h"
 #include "ue_wrap/actors/prop.h"
@@ -70,6 +71,30 @@ HandView NoteHandViewPost(void* actor) {
 ue_wrap::script_gate::Verdict OnK2DestroyPre(void* context, void* /*srcObj*/, const uint8_t* /*parms*/) {
     using ue_wrap::script_gate::Verdict;
     if (!context) return Verdict::Run;
+    // The drone sack's re-mount transition, mirrored at the destroy's entry: the game's own
+    // putSackOn sets takenByDrone before it destroys the loose prop, and its post-destroy guard
+    // (prop_dronesack_C::receiveDestroyed) scolds and respawns a sack that dies still reading
+    // loose. Every multiplayer destroy of the sack is that re-mount -- the host's container
+    // put-in, or the wire-applied mirror on this receiver -- and neither runs the Blueprint step
+    // on the peer that destroys, so the marker goes in before the engine takes the actor: one
+    // site, whichever graph called the destroy.
+    if (ue_wrap::drone::IsSackProp(context)) {
+        ue_wrap::drone::SetSackTaken(context, true);
+        // The re-mount's visual half, completed here for the same reason. The game's dropSack
+        // hides the drone's own sack mesh with SetVisibility and its putSackOn is the only step
+        // that shows it again, so a multiplayer put-back leaves the host's mesh hidden (the
+        // host's own game never ran its putSackOn) and the acting client's waiting on the host's
+        // word. The marker above has already said this destroy is the re-mount, so the mesh
+        // follows it on whichever peer's graph called the destroy -- instant local feedback, the
+        // console click's precedent, with the host's word confirming the state a packet later.
+        if (void* drone = ue_wrap::drone::Find()) {
+            // Said once per drone instance: a new session or level re-arms it.
+            static std::atomic<void*> s_sackRemountDrone{nullptr};
+            if (ue_wrap::drone::SetSackVisual(drone, true) && !s_sackRemountDrone.exchange(drone)) {
+                UE_LOGI("drone: the drone's own sack visual is shown -- a sack was put back here");
+            }
+        }
+    }
     HandViewDestroy* freeSlot = nullptr;
     for (HandViewDestroy& r : g_handViewDestroy) {
         if (r.actor == context) {

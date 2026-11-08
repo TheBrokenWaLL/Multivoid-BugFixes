@@ -270,6 +270,23 @@ bool AttachActorToComponentSocket(void* actor, void* component, const wchar_t* s
     return Call(actor, f);
 }
 
+bool AttachActorToComponentKeepWorld(void* actor, void* component) {
+    // Attach without snapping: the caller first converges the actor's world transform to the
+    // authoritative pose, then this preserves that pose as the child's relative transform.
+    if (!actor || !R::IsLive(actor) || !component || !R::IsLive(component)) return false;
+    void* fn = ActorFn(&g_attachCompFn, L"K2_AttachToComponent");
+    if (!fn) { UE_LOGW("engine: K2_AttachToComponent unresolved -- cannot keep-world attach"); return false; }
+    const R::FName noSocket{};
+    ParamFrame f(fn);
+    f.Set<void*>(L"Parent", component);
+    f.SetRaw(L"SocketName", &noSocket, sizeof(noSocket));
+    f.Set<uint8_t>(L"LocationRule", uint8_t{1});  // EAttachmentRule::KeepWorld
+    f.Set<uint8_t>(L"RotationRule", uint8_t{1});  // KeepWorld
+    f.Set<uint8_t>(L"ScaleRule",    uint8_t{1});  // KeepWorld
+    f.Set<bool>(L"bWeldSimulatedBodies", false);
+    return Call(actor, f);
+}
+
 bool DetachActorFromParent(void* actor) {
     // Generic detach (K2_DetachFromActor, KeepWorld) -- leaves `actor` where the attach
     // left it so a subsequent pose-drive / ragdoll takes over cleanly. Game thread.

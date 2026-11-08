@@ -10,11 +10,16 @@
 
 #include "coop/interactables/drone_sync.h"
 
+#include "coop/element/registry.h"
+
 #include "coop/element/lerp_window.h"
 #include "coop/net/protocol.h"
 #include "coop/net/session.h"
+#include "coop/props/prop_key_index.h"
+#include "coop/props/remote_prop.h"
 
 #include "ue_wrap/devices/drone.h"
+#include "ue_wrap/actors/prop.h"
 #include "ue_wrap/core/log.h"
 #include "ue_wrap/core/types.h"  // FVector, FRotator, NormalizeAxis
 
@@ -32,6 +37,24 @@ using ue_wrap::FVector;
 using ue_wrap::FRotator;
 
 constexpr uint64_t kSendIntervalMs = 50;   // ~20 Hz at most, while the drone moves or its state changes
+constexpr uint64_t kContainerBindRetryMs = 1000; // retry after the world/key index loads or the actor respawns
+// The drone's own sack apparatus resolves with the drone actor, so a handful of spaced attempts
+// covers a construction script that lands after the host's first word; past them the visual is
+// somebody else's problem (the census names the components).
+constexpr int kSackVisualMaxTries = 40;
+
+// The put-back's completion, host-authored. In single player a sack put back on the drone ends in
+// the loose prop's destroy, which trips the game's own post-destroy guard: its respawn lands on the
+// drone's socket and runs putSackOn, and THAT is what sets the drone's hasSack and shows the drone's
+// own sack mesh. In multiplayer every destroy of the sack is clean -- the destroy seam mirrors the
+// re-mount marker so the guard stays quiet on every peer, with no toast and no per-peer phantom --
+// so that loop never runs and a host drone that had its sack put back would carry no sack at all,
+// and the sack would vanish from every screen. The host therefore authors the completion itself: a
+// loose sack prop that disappears while the drone is parked IS a sack put back, the host's own word
+// then carries it to every peer, and the flag's own tick-driven readers (the host's Blueprint, the
+// client's gate fields and SetSackVisual) take it from there.
+bool     g_hostSackWasPresent = false;  // the host's last read had a loose sack prop
+bool     g_putBackLogged = false;       // the completion, said once a put-back
 // Past its flight and its dust, how far the drone must be from the pose last sent for a new one to
 // go: a glide streams until it is this close to where it rests, and a parked drone sends nothing.
 constexpr float    kMoveEpsCm  = 1.0f;
@@ -54,6 +77,25 @@ struct DroneMirror {
     bool    haveStateBits = false;
     int8_t  hostActive = -1;      // the host's last word on Active: 1, 0, or -1 before any
     bool    leaveWriteWarned = false;  // the leave timer's failed write, said once a session
+    bool    sackSyncPending = false;   // the sack actor may load after its DroneState arrived
+    bool    sackPresent = false;
+    bool    sackAttached = false;
+    bool    sackPoseValid = false;
+    bool    sackSimulating = false;
+    FVector sackLoc{};
+    FRotator sackRot{};
+    uint64_t nextSackSyncMs = 0;
+    uint32_t sackEid = 0;
+    coop::net::WireKey sackKey{};
+    // The drone's own sack visual (its BP's sack* components), mirrored from the host's hasSack
+    // word: -1 before the host's first word settles it, 0/1 the state last written. A client cancels
+    // its dropSack body, so nothing local hides the apparatus after a host drop without this.
+    int8_t  sackVisualOn = -1;
+    bool    sackVisualPending = false;  // the apparatus has not resolved yet -- retry
+    bool    sackVisualLogged = false;   // the first transition, said once a session
+    bool    sackAboard = false;         // the host's hasSack word: a sack is aboard the drone
+    int     sackVisualTries = 0;        // spent attempts while the apparatus does not resolve
+    uint64_t nextSackVisualMs = 0;
     // The newest word that arrived before this peer's drone resolved, waiting whole -- the pose and the
     // gate fields with it -- for the first tick that finds the drone.
     bool    hasPending = false;
@@ -65,11 +107,18 @@ DroneMirror g_m;
 // state when Active or the FX / gate bits differ from it. The check itself runs at the send cadence,
 // so a parked drone costs a few memory reads twenty times a second.
 uint64_t g_nextCheckMs = 0;
+uint64_t g_nextContainerBindMs = 0;
+bool g_containerBindWarned = false;
 bool     g_haveSent   = false;
 FVector  g_sentLoc{};
 FRotator g_sentRot{};
 bool     g_sentActive = false;
 uint8_t  g_sentBits   = 0;
+bool     g_sentSackPose = false;
+FVector  g_sentSackLoc{};
+FRotator g_sentSackRot{};
+uint32_t g_sentSackEid = 0;
+coop::net::WireKey g_sentSackKey{};
 bool     g_installLogged  = false;  // latch the install log (Install is the per-tick ensure path)
 
 uint64_t NowMs() {
@@ -77,19 +126,86 @@ uint64_t NowMs() {
         std::chrono::steady_clock::now().time_since_epoch()).count());
 }
 
+// Both drone_C::compileOrder and prop_dronesack_C::openPropInv must see the same GObjStack slot.
+// The drone's cooked BeginPlay lookup uses the unrelated key "droneContainer" and can leave its
+// container field pointing at a private, live-but-wrong inventory. Resolve the sack's world actor
+// by its exact key and bind the drone to it on both peers. Retry slowly: the key index may still be
+// seeding when the session starts, and the keyed actor can be recreated with a new address.
+void BindSharedSackContainer(void* drone) {
+    const uint64_t nowMs = NowMs();
+    if (nowMs < g_nextContainerBindMs) return;
+    g_nextContainerBindMs = nowMs + kContainerBindRetryMs;
+
+    void* const container = coop::prop_key_index::Find(L"drone_InventoryContainer");
+    if (!container) return; // world not indexed yet; retry on the next interval
+    if (!D::SetContainer(drone, container) && !g_containerBindWarned) {
+        g_containerBindWarned = true;
+        UE_LOGW("drone_sync: key 'drone_InventoryContainer' resolved, but it is not a live drone inventory container");
+    }
+}
+
 // The host's drone as one check reads it, from memory.
 struct HostRead {
     FVector  loc{};
     FRotator rot{};
     bool     active = false;
-    uint8_t  bits = 0;  // bit0 rotor dust, bit1 arrived, bit2 hasSack, bit3 leaveAfter5min
+    uint8_t  bits = 0;  // FX/gates plus sack presence and physical attachment
+    bool     sackPresent = false;
+    bool     sackPoseValid = false;
+    uint32_t sackEid = 0;
+    coop::net::WireKey sackKey{};
+    FVector  sackLoc{};
+    FRotator sackRot{};
 };
 
 bool ReadHost(void* drone, HostRead& r) {
     if (!D::ReadPose(drone, r.loc, r.rot)) return false;
     r.active = D::IsActive(drone);
     r.bits = D::ReadFxBits(drone);
+    if (void* sack = D::FindSack(drone)) {
+        r.sackPresent = true;
+        // Keep the sack's own openPropInv target aligned with the drone's shared inventory.
+        D::SetSackContainer(drone, sack);
+        const auto eid = coop::element::Registry::Get().EidForActor(sack);
+        if (eid != coop::element::kInvalidId && coop::element::Registry::IsHostId(eid))
+            r.sackEid = static_cast<uint32_t>(eid);
+        const std::wstring key = ue_wrap::prop::GetKeyString(sack);
+        if (!key.empty() && key.size() <= sizeof(r.sackKey.data)) {
+            bool ascii = true;
+            for (size_t i = 0; i < key.size(); ++i) {
+                if (key[i] < 0x20 || key[i] > 0x7E) { ascii = false; break; }
+                r.sackKey.data[i] = static_cast<char>(key[i]);
+            }
+            if (ascii) r.sackKey.len = static_cast<uint8_t>(key.size());
+            else r.sackKey = coop::net::WireKey{};
+        }
+        r.sackPoseValid = D::ReadPose(sack, r.sackLoc, r.sackRot);
+    }
     return true;
+}
+
+bool SackIdentityChanged(const HostRead& r) {
+    const uint32_t eid = r.sackPresent ? r.sackEid : 0;
+    const coop::net::WireKey& key = r.sackPresent ? r.sackKey : coop::net::WireKey{};
+    return eid != g_sentSackEid || key.len != g_sentSackKey.len ||
+           std::memcmp(key.data, g_sentSackKey.data, sizeof(key.data)) != 0;
+}
+
+bool SackPoseChanged(const HostRead& r) {
+    // A detached sack has an independent physical trajectory; stream its changed pose so the
+    // client can converge the drop. An attached sack follows the drone's already-streamed transform.
+    if (!r.sackPresent || !r.sackPoseValid || (r.bits & D::kFxSackAttached)) return false;
+    if (!g_sentSackPose) return true;
+    const float dx = r.sackLoc.X - g_sentSackLoc.X;
+    const float dy = r.sackLoc.Y - g_sentSackLoc.Y;
+    const float dz = r.sackLoc.Z - g_sentSackLoc.Z;
+    auto angleChanged = [](float a, float b) {
+        return std::fabs(ue_wrap::NormalizeAxis(a - b)) > kTurnEpsDeg;
+    };
+    return dx * dx + dy * dy + dz * dz > kMoveEpsCm * kMoveEpsCm ||
+           angleChanged(r.sackRot.Pitch, g_sentSackRot.Pitch) ||
+           angleChanged(r.sackRot.Yaw, g_sentSackRot.Yaw) ||
+           angleChanged(r.sackRot.Roll, g_sentSackRot.Roll);
 }
 
 void FillPayload(void* drone, const HostRead& r, bool adopt, coop::net::DroneStatePayload& p) {
@@ -106,6 +222,22 @@ void FillPayload(void* drone, const HostRead& r, bool adopt, coop::net::DroneSta
         FVector a;
         if (D::ReadDustAnchor(drone, a)) { p.dustX = a.X; p.dustY = a.Y; p.dustZ = a.Z; }
         else                             { p.stateBits &= ~D::kFxDust; }
+    }
+    if (r.sackPresent) {
+        p.stateBits |= D::kFxSackPresent;
+        p.sackEid = r.sackEid;
+        p.sackKey = r.sackKey;
+        if (r.sackPoseValid) {
+            p.stateBits |= D::kFxSackPose;
+            p.sackX = r.sackLoc.X; p.sackY = r.sackLoc.Y; p.sackZ = r.sackLoc.Z;
+            p.sackPitch = r.sackRot.Pitch; p.sackYaw = r.sackRot.Yaw; p.sackRoll = r.sackRot.Roll;
+        } else {
+            p.stateBits &= ~D::kFxSackPose;
+        }
+    } else {
+        p.stateBits &= ~(D::kFxSackPresent | D::kFxSackAttached | D::kFxSackPose);
+        p.sackEid = 0;
+        p.sackKey = coop::net::WireKey{};
     }
 }
 
@@ -154,6 +286,46 @@ void ApplyMirror(void* drone, DroneMirror& e) {
     e.dirty = false;
 }
 
+void* ResolveSackActor(void* drone, const DroneMirror& e) {
+    // Host absence is authoritative. Falling back to a save-loaded mounted client sack here would
+    // resurrect the visual ghost after the host has already dropped/removed it.
+    if (!e.sackPresent) return nullptr;
+    if (e.sackEid != 0 && e.sackEid != coop::element::kInvalidId) {
+        if (void* actor = coop::element::LivePropActor(e.sackEid)) return actor;
+    }
+    if (e.sackKey.len > 0 && e.sackKey.len <= sizeof(e.sackKey.data)) {
+        std::wstring key;
+        key.reserve(e.sackKey.len);
+        for (uint8_t i = 0; i < e.sackKey.len; ++i)
+            key.push_back(static_cast<wchar_t>(static_cast<unsigned char>(e.sackKey.data[i])));
+        if (void* actor = coop::prop_key_index::Find(key)) return actor;
+    }
+    // No network identity yet (e.g. a save-native sack without a Key/EID): reuse the local sack
+    // only while the host explicitly says one exists.
+    return drone ? D::FindSack(drone) : nullptr;
+}
+
+void RetireStaleMountedSacks(void* drone, void* authoritativeSack, bool hostAttached) {
+    if (!drone) return;
+    // When the host says the sack is still mounted but its exact actor has not loaded yet, do not
+    // destroy the local candidate. Once the authoritative actor is known, remove every other
+    // mounted twin. If the host says it is detached/absent, the old local socket actor is stale.
+    if (hostAttached && !authoritativeSack) return;
+    void* exclude = authoritativeSack;
+    for (int i = 0; i < 8; ++i) {
+        void* const mounted = D::FindAttachedSack(drone, exclude);
+        if (!mounted) break;
+        exclude = mounted;
+        if (coop::remote_prop::IsOwnedHere(mounted)) continue; // never steal a local player's hold
+        const auto eid = coop::remote_prop::ResolveMirrorEidByActor(mounted, /*wireMirrorOnly=*/true);
+        if (eid != coop::element::kInvalidId) coop::remote_prop::UnregisterPropMirror(eid);
+        coop::remote_prop::ClearAnyDriveFor(mounted);
+        UE_LOGW("drone: retiring stale client-mounted sack %p; authoritative=%p attached=%d",
+                mounted, authoritativeSack, hostAttached ? 1 : 0);
+        coop::remote_prop::ConsumeLocalActor(mounted);
+    }
+}
+
 }  // namespace
 
 void Install(coop::net::Session* session) {
@@ -171,6 +343,7 @@ namespace {
 // state. Game thread.
 void ApplyState(void* drone, const coop::net::DroneStatePayload& payload) {
     if (!g_m.suppressed) { D::SuppressTick(drone); g_m.suppressed = true; }
+    BindSharedSackContainer(drone);
     SetTarget(g_m, payload, /*snap*/ payload.adopt != 0);
     // FX mirror: the suppressed tick kills the rotor-dust particle and the delivery alarm cue, so
     // replay them off the synced state the host packs in FillPayload -- the dust as a per-packet
@@ -183,6 +356,50 @@ void ApplyState(void* drone, const coop::net::DroneStatePayload& payload) {
     const bool hasSack    = (nb & D::kFxHasSack) != 0;
     const bool leaveAfter5min = (nb & D::kFxLeaveAfter5min) != 0;
 
+    // A sack is a separate actor, not part of drone_C's transform. Resolve the exact host actor
+    // by EID/key, then mirror its attachment edge and detached physics pose. Retry when the prop
+    // arrives after its DroneState; never choose a sack solely because it shares the inventory.
+    g_m.sackPresent = (nb & D::kFxSackPresent) != 0;
+    g_m.sackAttached = (nb & D::kFxSackAttached) != 0;
+    g_m.sackAboard = hasSack;
+    g_m.sackPoseValid = (nb & D::kFxSackPose) != 0;
+    g_m.sackSimulating = (nb & D::kFxSackSimulating) != 0;
+    g_m.sackEid = payload.sackEid;
+    g_m.sackKey = payload.sackKey;
+    g_m.sackLoc = FVector{payload.sackX, payload.sackY, payload.sackZ};
+    g_m.sackRot = FRotator{payload.sackPitch, payload.sackYaw, payload.sackRoll};
+    void* const sack = ResolveSackActor(drone, g_m);
+    RetireStaleMountedSacks(drone, sack, g_m.sackAttached);
+    if (sack && coop::remote_prop::IsOwnedHere(sack)) {
+        // The local grab/drive owns the actor until release; don't attach or teleport it out of
+        // the player's hands just because an older DroneState packet is still in flight.
+        g_m.sackSyncPending = true;
+    } else {
+        g_m.sackSyncPending = !D::ApplySackMirror(drone, sack, g_m.sackPresent,
+                                                  g_m.sackAttached, g_m.sackSimulating,
+                                                  g_m.sackPoseValid, g_m.sackLoc, g_m.sackRot);
+    }
+    g_m.nextSackSyncMs = NowMs() + 250;
+
+    // The drone's own sack visual: the client cancelled the Blueprint body that would have hidden
+    // it, so the apparatus under the drone stays up after a host drop. The word that means "a sack
+    // is aboard" is hasSack -- the mounted sack is this apparatus, not the prop actor, so the
+    // attachment bit says nothing about the parked state -- and it is the same bit the action
+    // options are gated on, so the visual and the offered verbs never disagree. Retry while the
+    // drone's construction script has not instantiated the apparatus yet.
+    if (g_m.sackVisualOn != (g_m.sackAboard ? 1 : 0)) {
+        g_m.sackVisualPending = !D::SetSackVisual(drone, g_m.sackAboard);
+        if (!g_m.sackVisualPending) {
+            g_m.sackVisualOn = g_m.sackAboard ? 1 : 0;
+            if (!g_m.sackVisualLogged) {
+                g_m.sackVisualLogged = true;
+                UE_LOGI("drone: the drone's own sack visual is %s -- the host reports a sack %s",
+                        g_m.sackAboard ? "shown" : "hidden",
+                        g_m.sackAboard ? "aboard the drone" : "off the drone");
+            }
+        }
+    }
+
     // Interaction gate: write canTakeOff (THE gate) + hasSack (option prerequisite) onto the mirror so
     // a parked drone is interactable instead of "in motion" (the suppressed tick never sets them).
     D::WriteGateFields(drone, canTakeOff, hasSack);
@@ -190,13 +407,6 @@ void ApplyState(void* drone, const coop::net::DroneStatePayload& payload) {
         g_m.leaveWriteWarned = true;
         UE_LOGW("drone_sync: the host's leave timer could not be written onto this copy's drone");
     }
-    if (hasSack)
-        D::RepointContainer(drone);  // cargo aboard -> point the mirror at the prop-mirrored container.
-                                     // EVERY hasSack packet (not just the rising edge): the container
-                                     // may stream in AFTER the edge, or be destroyed+respawned (new
-                                     // address) -- RepointContainer short-circuits when the field is
-                                     // already a live container, so steady-state cost is ~one deref.
-
     // Dust: replay the blueprint's per-tick dust update on EVERY packet rather than on bit edges.
     // The anchor moves with the drone, the intensity tracks ground distance, and the
     // EmitterLoops=1/20s system self-completes and needs the IsActive != want re-arm -- all of it
@@ -232,7 +442,11 @@ void OnReliable(const coop::net::DroneStatePayload& payload) {
     if (!s) return;  // from the host alone: its receive edge refuses a client's copy
     if (!std::isfinite(payload.x) || !std::isfinite(payload.y) || !std::isfinite(payload.z) ||
         !std::isfinite(payload.pitch) || !std::isfinite(payload.yaw) || !std::isfinite(payload.roll) ||
-        !std::isfinite(payload.dustX) || !std::isfinite(payload.dustY) || !std::isfinite(payload.dustZ)) {
+        !std::isfinite(payload.dustX) || !std::isfinite(payload.dustY) || !std::isfinite(payload.dustZ) ||
+        !std::isfinite(payload.sackX) || !std::isfinite(payload.sackY) || !std::isfinite(payload.sackZ) ||
+        !std::isfinite(payload.sackPitch) || !std::isfinite(payload.sackYaw) || !std::isfinite(payload.sackRoll) ||
+        payload.sackKey.len > sizeof(payload.sackKey.data) ||
+        (payload.sackEid != 0 && !coop::element::Registry::IsAllowedHostAllocatedEid(payload.sackEid))) {
         UE_LOGW("drone: OnReliable non-finite pose -- dropping");
         return;
     }
@@ -256,6 +470,7 @@ void QueueConnectBroadcastForSlot(int peerSlot) {
     if (peerSlot < 0 || peerSlot >= static_cast<int>(coop::net::kMaxPeers)) return;
     void* drone = D::Find();
     if (!drone) { UE_LOGI("drone: connect-snapshot -- no drone present (skip) slot %d", peerSlot); return; }
+    BindSharedSackContainer(drone);
     HostRead r;
     if (!ReadHost(drone, r)) return;
     coop::net::DroneStatePayload p{};
@@ -271,6 +486,10 @@ void Tick() {
     void* drone = D::Find();
     if (!drone) return;
 
+    // The drone and the sack open the same delivery inventory. Keep the drone's field bound to the
+    // exact keyed actor on host and client, even when no sack is currently attached.
+    BindSharedSackContainer(drone);
+
     if (s->role() == coop::net::Role::Host) {
         // HOST authority. While the drone is Active or its dust is on, the stream runs as it always did:
         // the client replays the dust once per packet, and the effect ends itself unless re-armed. Past
@@ -283,14 +502,34 @@ void Tick() {
         g_nextCheckMs = nowMs + kSendIntervalMs;
         HostRead r;
         if (!ReadHost(drone, r)) return;
+        // The put-back's completion: the loose sack prop is gone while the drone is parked, which
+        // is a sack put back (the only way a sack prop dies beside a parked drone). The host sets
+        // its own sack-aboard flag, as the game's own recovery would have, and the word carries it.
+        bool putBack = false;
+        if (!r.sackPresent && g_hostSackWasPresent && (r.bits & D::kFxArrived) != 0) {
+            putBack = true;
+            if (!g_putBackLogged) {
+                g_putBackLogged = true;
+                UE_LOGI("drone: the sack was put back on the drone -- the host carries the sack aboard");
+            }
+        }
+        g_hostSackWasPresent = r.sackPresent;
+        if (r.sackPresent) g_putBackLogged = false;  // re-armed for the next put-back
+        // The Blueprint can leave hasSack set after its sack actor has been detached. Keep the
+        // host's interaction options in lockstep with the actual physical attachment too.
+        D::WriteGateFields(drone, (r.bits & D::kFxArrived) != 0,
+                           (r.bits & D::kFxHasSack) != 0 || putBack);
         const float dx = r.loc.X - g_sentLoc.X, dy = r.loc.Y - g_sentLoc.Y, dz = r.loc.Z - g_sentLoc.Z;
         const bool moved =
             !g_haveSent || dx * dx + dy * dy + dz * dz > kMoveEpsCm * kMoveEpsCm ||
             std::fabs(ue_wrap::NormalizeAxis(r.rot.Pitch - g_sentRot.Pitch)) > kTurnEpsDeg ||
             std::fabs(ue_wrap::NormalizeAxis(r.rot.Yaw - g_sentRot.Yaw)) > kTurnEpsDeg ||
             std::fabs(ue_wrap::NormalizeAxis(r.rot.Roll - g_sentRot.Roll)) > kTurnEpsDeg;
+        const bool sackMoved = SackPoseChanged(r);
+        const bool sackIdentityChanged = SackIdentityChanged(r);
         const bool streaming = r.active || (r.bits & D::kFxDust) != 0;
-        if (!streaming && !moved && r.active == g_sentActive && r.bits == g_sentBits) return;
+        if (!streaming && !moved && !sackMoved && !sackIdentityChanged &&
+            r.active == g_sentActive && r.bits == g_sentBits) return;
         coop::net::DroneStatePayload p{};
         FillPayload(drone, r, /*adopt*/false, p);
         if (!s->SendReliable(coop::net::ReliableKind::DroneState, &p, sizeof(p))) return;
@@ -298,7 +537,11 @@ void Tick() {
         g_sentLoc = r.loc;
         g_sentRot = r.rot;
         g_sentActive = r.active;
-        g_sentBits = r.bits;  // the bits as read: FillPayload drops the dust bit when its anchor is unread
+        g_sentBits = r.bits;  // the bits as read: FillPayload drops optional FX/pose bits when unread
+        g_sentSackPose = r.sackPresent && r.sackPoseValid;
+        if (g_sentSackPose) { g_sentSackLoc = r.sackLoc; g_sentSackRot = r.sackRot; }
+        g_sentSackEid = r.sackPresent ? r.sackEid : 0;
+        g_sentSackKey = r.sackPresent ? r.sackKey : coop::net::WireKey{};
     } else {
         // CLIENT: the drone is ALWAYS a mirror -- suppress its own flight tick once, take a word that
         // waited for the drone to resolve, then drive the interp toward the last streamed pose (no-op
@@ -307,6 +550,37 @@ void Tick() {
         if (g_m.hasPending) {
             g_m.hasPending = false;
             ApplyState(drone, g_m.pending);
+        }
+        if (g_m.sackSyncPending && NowMs() >= g_m.nextSackSyncMs) {
+            void* const sack = ResolveSackActor(drone, g_m);
+            RetireStaleMountedSacks(drone, sack, g_m.sackAttached);
+            if (sack && coop::remote_prop::IsOwnedHere(sack)) {
+                g_m.sackSyncPending = true;
+            } else {
+                g_m.sackSyncPending = !D::ApplySackMirror(drone, sack, g_m.sackPresent,
+                                                          g_m.sackAttached, g_m.sackSimulating,
+                                                          g_m.sackPoseValid, g_m.sackLoc, g_m.sackRot);
+            }
+            g_m.nextSackSyncMs = NowMs() + 250;
+        }
+        if (g_m.sackVisualPending && NowMs() >= g_m.nextSackVisualMs) {
+            // The apparatus itself may resolve after the host's word (the construction script's
+            // components land with the actor's BeginPlay, which a streaming joiner can beat).
+            if (g_m.sackVisualOn != (g_m.sackAboard ? 1 : 0))
+                g_m.sackVisualPending = !D::SetSackVisual(drone, g_m.sackAboard);
+            else
+                g_m.sackVisualPending = false;
+            if (!g_m.sackVisualPending) {
+                g_m.sackVisualOn = g_m.sackAttached ? 1 : 0;
+                g_m.sackVisualTries = 0;
+            } else if (++g_m.sackVisualTries >= kSackVisualMaxTries) {
+                g_m.sackVisualPending = false;   // spend no more ticks on a drone with no apparatus
+                g_m.sackVisualTries = 0;
+                UE_LOGW("drone: the drone's own sack visual did not resolve in %d attempts -- the "
+                        "duplicate under the drone stays; the census names its components",
+                        kSackVisualMaxTries);
+            }
+            g_m.nextSackVisualMs = NowMs() + 250;
         }
         if (g_m.hasPose) { AdvanceInterp(g_m); ApplyMirror(drone, g_m); }
     }
@@ -320,11 +594,20 @@ void OnDisconnect() {
     }
     g_m = DroneMirror{};
     g_nextCheckMs = 0;
+    g_nextContainerBindMs = 0;
+    g_containerBindWarned = false;
     g_haveSent = false;
     g_sentLoc = FVector{};
     g_sentRot = FRotator{};
     g_sentActive = false;
     g_sentBits = 0;
+    g_sentSackPose = false;
+    g_sentSackLoc = FVector{};
+    g_sentSackRot = FRotator{};
+    g_sentSackEid = 0;
+    g_sentSackKey = coop::net::WireKey{};
+    g_hostSackWasPresent = false;
+    g_putBackLogged = false;
     g_installLogged = false;
 }
 
